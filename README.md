@@ -71,6 +71,35 @@ synthesized, so the turn fails with a real message instead of a parse error.
 null-valued typed fields are stripped; `{"error":"str"}` is reshaped to
 `{"error":{"message":"str"}}`.
 
+## Model-based vision handoff
+
+A text-only model cannot see images. When a request targets a configured
+text-only model **and** carries image parts, the proxy:
+
+1. captions each image with a vision model (`glm-5.3-flash` by default),
+2. replaces the image part with the caption text,
+3. forwards the request to the **original** model with the same `stream` flag.
+
+One request in, one stream out — invisible to the client. The original model
+answers normally, using the caption. Captions are cached by image hash (1h TTL,
+200 entries), so the same screenshot resent on later turns costs nothing —
+measured: 5.3s cold vs 1.1s warm, identical answer.
+
+Config:
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `LOGFARE_PROXY_VISION` | on | `0` disables the handoff |
+| `LOGFARE_PROXY_VISION_TARGETS` | `glm-5.3` | comma list of text-only models to hand off (`*` wildcard supported) |
+| `LOGFARE_PROXY_VISION_MODEL` | `glm-5.3-flash` | vision model used for captions |
+| `LOGFARE_PROXY_VISION_PROMPT` | built-in | caption prompt override |
+
+Accepted image shapes: `{"type":"image_url","image_url":{"url":...}}`,
+`{"type":"image","source":{"media_type","data"}}`, `{"type":"input_image"}`.
+If the vision call fails, the image is replaced with
+`[Image attached by the user — vision analysis unavailable]` so the turn still
+proceeds.
+
 ### Retry classes
 
 | Failure | Class | Behavior |
@@ -98,6 +127,10 @@ bun index.js            # or: node index.js
 | `LOGFARE_PROXY_UPSTREAM` | `https://logfare.ai/v1` | upstream base URL |
 | `LOGFARE_PROXY_KEY` | — | fallback bearer token when the request has none |
 | `LOGFARE_PROXY_DEBUG` | off | `1` = log every upstream chunk and forwarded event |
+| `LOGFARE_PROXY_VISION` | on | `0` disables the vision handoff |
+| `LOGFARE_PROXY_VISION_TARGETS` | `glm-5.3` | text-only models that receive captions instead of images |
+| `LOGFARE_PROXY_VISION_MODEL` | `glm-5.3-flash` | vision model used to caption images |
+| `LOGFARE_PROXY_VISION_PROMPT` | built-in | caption prompt override |
 | `LOGFARE_PROXY_RL_BUDGET_MS` | `1500000` | patient-retry wall-clock budget |
 | `LOGFARE_PROXY_RL_BACKOFF_MS` | `5000,7000,10000,15000,20000,30000` | patient backoff ladder |
 | `LOGFARE_PROXY_BACKOFF_MS` | `300,600,1000,2000,3000` | hard-failure backoff ladder |
@@ -113,11 +146,12 @@ Per-request overrides (stripped before forwarding): `x-lf-upstream`,
 bun test/run-tests.mjs
 ```
 
-Spins a mock upstream plus the proxy and asserts 17 scenarios: pre-commit
+Spins a mock upstream plus the proxy and asserts 19 scenarios: pre-commit
 retry, post-commit drop, in-band error retry, give-up after exactly 10 retries,
 null-field repair, mid-stream healing, non-stream passthrough, bulk-JSON
 conversion, stall retry, 200+8006 same-body retry, budget exhaustion surfacing
-the real error, and patient TPM retry.
+the real error, patient TPM retry, vision handoff (image → caption → text
+model), and caption caching (no second vision call).
 
 ## Operational notes
 

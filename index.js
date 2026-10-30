@@ -53,6 +53,7 @@
 
 import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -76,6 +77,33 @@ const RATE_LIMIT_RE = /(rate.?limit|per.?(minute|hour)|too many requests|quota|\
 // arrives as HTTP 200 + JSON error body, or 413): NOT deterministic — the
 // same body succeeds on a later attempt, so retry patiently like rate limits.
 const PATIENT_SIZE_RE = /(exceeds the maximum supported size|payload too large|request (body|entity) too large|"code"\s*:\s*8006|\b8006\b)/i;
+
+// ---- model-based vision handoff ----
+// A text-only target model that receives image parts cannot see them. The
+// proxy captions each image with a vision model and replaces the image part
+// with the caption text, then forwards the request to the ORIGINAL model —
+// one request in, one stream out, invisible to the client. Captions are
+// cached by image hash: the same screenshot resent on later turns is free.
+const VISION_MODEL_DEFAULT = "glm-5.3-flash";
+const VISION_TARGETS_DEFAULT = "glm-5.3";
+const VISION_PROMPT_DEFAULT = "Describe this image in full detail for a text-only assistant that cannot see it. Transcribe all text, code, UI labels, error messages, tables and diagrams exactly. Be complete but concise.";
+const VISION_CACHE_TTL_MS = 60 * 60 * 1000;
+const VISION_CACHE_MAX = 200;
+const VISION_ENABLED = !/^(0|false|off)$/i.test(process.env.LOGFARE_PROXY_VISION || "");
+const VISION_MODEL = process.env.LOGFARE_PROXY_VISION_MODEL || VISION_MODEL_DEFAULT;
+const VISION_TARGETS = (process.env.LOGFARE_PROXY_VISION_TARGETS || VISION_TARGETS_DEFAULT).split(",").map((s) => s.trim()).filter(Boolean);
+const VISION_PROMPT = process.env.LOGFARE_PROXY_VISION_PROMPT || VISION_PROMPT_DEFAULT;
+const visionCache = new Map();
+function visionCacheGet(k) {
+  const e = visionCache.get(k);
+  if (!e) return null;
+  if (Date.now() - e.time > VISION_CACHE_TTL_MS) { visionCache.delete(k); return null; }
+  return e.text;
+}
+function visionCacheSet(k, text) {
+  if (visionCache.size >= VISION_CACHE_MAX) { try { visionCache.delete(visionCache.keys().next().value); } catch {} }
+  visionCache.set(k, { text, time: Date.now() });
+}
 const FIRST_BYTE_MS = 120000; // pre-commit: time to first event
 const IDLE_MS = 300000; // max gap between SSE events
 const ATTEMPT_TIMEOUT_MS = 1800000; // per attempt, mirrors provider timeout
@@ -273,6 +301,87 @@ function bulkToChunkJSON(obj) {
   });
 }
 
+// ---------- vision handoff helpers ----------
+function isImagePart(p) {
+  if (!p || typeof p !== "object") return false;
+  return p.type === "image_url" || p.type === "image" || p.type === "input_image";
+}
+
+function imageUrlOf(p) {
+  if (p.type === "image_url") {
+    if (typeof p.image_url === "string") return p.image_url;
+    if (p.image_url && typeof p.image_url.url === "string") return p.image_url.url;
+    return null;
+  }
+  if (p.type === "image") {
+    if (p.source && typeof p.source.data === "string") {
+      return `data:${p.source.media_type || "image/png"};base64,${p.source.data}`;
+    }
+    return p.url || null;
+  }
+  if (p.type === "input_image") return typeof p.image_url === "string" ? p.image_url : null;
+  return null;
+}
+
+function collectImageParts(body) {
+  const out = [];
+  const msgs = Array.isArray(body?.messages) ? body.messages : [];
+  for (let mi = 0; mi < msgs.length; mi++) {
+    const c = msgs[mi]?.content;
+    if (!Array.isArray(c)) continue;
+    for (let pi = 0; pi < c.length; pi++) {
+      if (isImagePart(c[pi])) {
+        const url = imageUrlOf(c[pi]);
+        if (url) out.push({ mi, pi, url });
+      }
+    }
+  }
+  return out;
+}
+
+// One non-streaming vision call against the same upstream + credentials.
+async function analyzeImage({ base, auth, url }) {
+  const body = {
+    model: VISION_MODEL,
+    stream: false,
+    max_tokens: 2000,
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: VISION_PROMPT },
+        { type: "image_url", image_url: { url } },
+      ],
+    }],
+  };
+  const headers = { "content-type": "application/json", ...(auth ? { authorization: auth } : {}) };
+  const target = `${base}/chat/completions`;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const im = await upstreamRequest(target, { method: "POST", headers, body: Buffer.from(JSON.stringify(body), "utf8") });
+      const text = await consumeBody(im);
+      const status = im.statusCode;
+      try { im.destroy(); } catch {}
+      if (status >= 400) {
+        lastErr = new Error(`vision status ${status}: ${snippet(text, 200)}`);
+      } else {
+        const j = JSON.parse(text);
+        const content = j?.choices?.[0]?.message?.content;
+        if (typeof content === "string" && content.trim()) return content.trim();
+        if (Array.isArray(content)) {
+          const joined = content.map((p) => (typeof p?.text === "string" ? p.text : "")).join("").trim();
+          if (joined) return joined;
+        }
+        lastErr = new Error(`vision response had no content: ${snippet(text, 160)}`);
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+    if (attempt < 3) await sleep(400 * attempt);
+  }
+  throw lastErr || new Error("vision analysis failed");
+}
+
 // ---------- helpers ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const RL_BUDGET_MS = Number(process.env.LOGFARE_PROXY_RL_BUDGET_MS) || RATE_LIMIT_BUDGET_MS_DEFAULT;
@@ -426,15 +535,16 @@ async function startServer(upstreamBase, port, mode) {
     let reqSize = 0;
     req.on("data", (c) => { chunks.push(c); reqSize += c.length; });
     await new Promise((resolve) => req.on("end", resolve));
-    const rawBody = Buffer.concat(chunks);
+    let rawBody = Buffer.concat(chunks);
 
     // stream wanted? (chat completions with stream:true)
     let wantsStream = false;
     let model = "?";
+    let reqJson = null;
     try {
-      const j = JSON.parse(rawBody.toString("utf8"));
-      wantsStream = j?.stream === true;
-      model = j?.model || "?";
+      reqJson = JSON.parse(rawBody.toString("utf8"));
+      wantsStream = reqJson?.stream === true;
+      model = reqJson?.model || "?";
     } catch {}
 
     // resolve upstream + key (header overrides stripped before forward)
@@ -461,6 +571,51 @@ async function startServer(upstreamBase, port, mode) {
     const fwdHeaders = buildForwardHeaders(req.headers, auth ? { authorization: auth } : {});
     const target = `${base}${suffix}`;
     const isStreamCt = (ct) => String(ct || "").toLowerCase().includes("text/event-stream");
+
+    // ---- model-based vision handoff ----
+    // Target model is text-only and the request carries images: caption each
+    // image with the vision model, swap the image part for the caption text,
+    // then continue to the ORIGINAL model with the same stream request.
+    if (VISION_ENABLED && reqJson) {
+      const targetModel = String(reqJson.model || "");
+      const matched = VISION_TARGETS.some((t) => t === "*" || t === targetModel || (t.endsWith("*") && targetModel.startsWith(t.slice(0, -1))));
+      if (matched && targetModel !== VISION_MODEL) {
+        const imgs = collectImageParts(reqJson);
+        if (imgs.length > 0) {
+          const origSize = reqSize;
+          let analyzed = 0, cached = 0, failed = 0;
+          for (const img of imgs) {
+            const key = createHash("sha256").update(img.url).digest("hex");
+            let desc = visionCacheGet(key);
+            if (desc) {
+              cached++;
+            } else {
+              try {
+                desc = await analyzeImage({ base, auth, url: img.url });
+                visionCacheSet(key, desc);
+                analyzed++;
+              } catch (e) {
+                log(`vision handoff failed: ${e?.message || e}`);
+                desc = null;
+                failed++;
+              }
+            }
+            const msgs = reqJson.messages;
+            if (msgs?.[img.mi]?.content) {
+              msgs[img.mi].content[img.pi] = {
+                type: "text",
+                text: desc
+                  ? `[Image attached by the user — description produced by ${VISION_MODEL}:]\n${desc}`
+                  : "[Image attached by the user — vision analysis unavailable]",
+              };
+            }
+          }
+          rawBody = Buffer.from(JSON.stringify(reqJson), "utf8");
+          reqSize = rawBody.length;
+          log(`vision handoff model=${targetModel} images=${imgs.length} analyzed=${analyzed} cached=${cached} failed=${failed} bytes ${origSize}->${reqSize}`);
+        }
+      }
+    }
 
     log(`req ${req.method} ${pathAndQuery} model=${model} stream=${wantsStream} bytes=${reqSize}`);
 
