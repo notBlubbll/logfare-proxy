@@ -1,0 +1,794 @@
+// logfare-proxy/index.js — OpenCode V2 plugin: autostarting retry-proxy for logfare.
+//
+// Purpose: opencode's V2 router throws
+//     "Invalid logfare/openai-compatible-chat stream event"
+// whenever a logfare SSE `data:` payload fails the openai-compatible-chat
+// schema decode (router: `Invalid ${route} stream event`). This proxy sits
+// between opencode (baseURL http://127.0.0.1:17330/v1) and
+// https://logfare.ai/v1 and makes that error impossible to reach the client:
+//
+//   - PRE-COMMIT: upstream SSE events are buffered and validated; NOTHING is
+//     forwarded until the stream proves valid. Any failure (non-2xx, network
+//     error, invalid event, in-band error payload, stall) = failed attempt
+//     -> the WHOLE request is retried with the same buffered body, up to
+//     10 retries (11 attempts) with backoff. Only after that does the last
+//     upstream failure pass through.
+//   - POST-COMMIT: every event is still validated before it is written;
+//     invalid events are DROPPED inline (logged) so the client parser can
+//     never see one; valid events pass through byte-exact.
+//   - UPSTREAM DEATH after commit: synthesizes a schema-VALID error chunk
+//     (`{"error":{"message":...,"type":"proxy_error"}}` + [DONE]) so the
+//     client sees a clean provider error — never a parse error.
+//   - REPAIR: semantically-null typed fields (`delta.content: null` etc.)
+//     are stripped (schema-safe, meaning-preserving); `{"error":"str"}`
+//     is reshaped to `{"error":{"message":"str"}}`.
+//
+// Auth/model passthrough: the inbound `authorization` header (the provider's
+// apiKey from opencode.json) is forwarded upstream unchanged; optional
+// `x-lf-key` / `x-lf-upstream` headers override per request and are stripped.
+// The request body (incl. the model id) is forwarded byte-exact.
+//
+// rev: 1 — initial port of the tinyproxy pattern (hot-reload guard via
+//      globalThis, Bun crash-proofing, Expect: 100-continue, idle watchdog,
+//      per-attempt init rebuild, bulk-JSON-to-SSE conversion, EADDRINUSE
+//      retry-listen so a standalone test instance can be taken over).
+// rev: 2 — real-world hardening after the "Build All Projects in
+//      Infinite-Cubes" post-mortem:
+//      - raw node:http(s) sockets instead of fetch (Bun fetch concatenates
+//        retried bytes into the same body on mid-body death);
+//      - agent:false + explicit destroy (a keep-alive socket abandoned at
+//        [DONE] re-delivered stale body bytes into the NEXT request);
+//      - upstream base path prefix stripped once (base .../v1 + client path
+//        /v1/chat/completions = /v1/v1/... 404);
+//      - patient retry classes: 429 / Serverless TPM / AiError 8006
+//        "request body exceeds the maximum supported size" — flaky per
+//        attempt, the SAME body succeeds on a later retry; 25-min budget,
+//        never consumes the 10 hard retries;
+//      - 200 + JSON error bodies are failures, never converted to chunks
+//        (that conversion was the "Invalid ... stream event" producer);
+//      - give-up emits the real upstream error as a schema-valid SSE event.
+// Standalone: `bun index.js` runs the same server outside opencode with env
+// overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
+// LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
+
+import { createServer, request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const TAG = "[logfare-proxy]";
+const UPSTREAM_DEFAULT = "https://logfare.ai/v1";
+const LISTEN_HOST = "127.0.0.1";
+const PORT_DEFAULT = 17330;
+const MAX_RETRIES = 10; // user spec: give up only after 10 retries (11 attempts)
+const BACKOFF_MS = [300, 600, 1000, 2000, 3000]; // then 3000 flat
+const RETRY_AFTER_CAP_MS = 60000;
+// "Serverless token-per-minute limit reached" (429 status or in-band stream
+// error): retry until it works — patient backoff within a budget (default
+// 25 min, just under opencode's own 30-min request timeout), honoring
+// Retry-After when present. Rate-limit retries do NOT consume the 10 hard
+// retries; only hard failures (5xx non-RL, network, invalid events) do.
+const RATE_LIMIT_BUDGET_MS_DEFAULT = 25 * 60 * 1000;
+const RATE_LIMIT_BACKOFF_DEFAULT = [5000, 7000, 10000, 15000, 20000, 30000];
+const RATE_LIMIT_RE = /(rate.?limit|per.?(minute|hour)|too many requests|quota|\b429\b|serverless|overloaded|capacity)/i;
+// "AiError ... request body exceeds the maximum supported size" (code 8006,
+// arrives as HTTP 200 + JSON error body, or 413): NOT deterministic — the
+// same body succeeds on a later attempt, so retry patiently like rate limits.
+const PATIENT_SIZE_RE = /(exceeds the maximum supported size|payload too large|request (body|entity) too large|"code"\s*:\s*8006|\b8006\b)/i;
+const FIRST_BYTE_MS = 120000; // pre-commit: time to first event
+const IDLE_MS = 300000; // max gap between SSE events
+const ATTEMPT_TIMEOUT_MS = 1800000; // per attempt, mirrors provider timeout
+const LOG_MAX_BYTES = 2 * 1024 * 1024;
+
+const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
+const LOG_FILE = path.join(PLUGIN_DIR, ".logfare-proxy.log");
+let logWrites = 0;
+
+function log(msg) {
+  const line = `${new Date().toISOString()} ${msg}`;
+  try { console.log(`${TAG} ${msg}`); } catch {}
+  try {
+    if ((logWrites++ & 63) === 0) {
+      try { if (fs.statSync(LOG_FILE).size > LOG_MAX_BYTES) fs.truncateSync(LOG_FILE, 0); } catch {}
+    }
+    fs.appendFileSync(LOG_FILE, line + "\n");
+  } catch {}
+}
+
+const DEBUG = /^(1|true|on)$/i.test(process.env.LOGFARE_PROXY_DEBUG || "");
+function dbg(msg) { if (DEBUG) log(`dbg ${msg}`); }
+
+// ---------- SSE eventizer ----------
+// Splits a byte stream into raw SSE events (terminated by a blank line),
+// preserving each event's raw text for byte-exact forwarding.
+function makeEventizer() {
+  let buf = "";
+  function findTerminator(s) {
+    let best = -1, len = 0;
+    for (const [t, l] of [["\r\n\r\n", 4], ["\n\n", 2], ["\r\r", 2]]) {
+      const i = s.indexOf(t);
+      if (i >= 0 && (best < 0 || i < best)) { best = i; len = l; }
+    }
+    return best < 0 ? null : { end: best, after: best + len };
+  }
+  return {
+    feed(text) {
+      buf += text;
+      const out = [];
+      let t;
+      while ((t = findTerminator(buf))) {
+        out.push(buf.slice(0, t.end));
+        buf = buf.slice(t.after);
+      }
+      return out;
+    },
+    flush() {
+      if (buf.trim() === "") { buf = ""; return []; }
+      const r = buf; buf = ""; return [r];
+    },
+  };
+}
+
+// Extract the joined `data:` payload of a raw SSE event ("" when none).
+function eventData(raw) {
+  const lines = raw.split(/\r\n|\r|\n/);
+  const datas = [];
+  for (const line of lines) {
+    if (line.startsWith(":")) continue; // comment
+    if (line.startsWith("data:")) {
+      let v = line.slice(5);
+      if (v.startsWith(" ")) v = v.slice(1);
+      datas.push(v);
+    } else if (line.trim() === "") {
+      // blank lines inside a captured chunk belong to no event (the
+      // terminator itself) — ignore
+    } else if (/^[A-Za-z-]+\s*:/.test(line)) {
+      // id:/event:/retry: fields — ignored for validation, raw event is
+      // forwarded as-is so they survive
+    } else {
+      // non-field garbage line inside an event: the SSE decoder would feed
+      // it as data too; treat it as data to keep the payload complete
+      datas.push(line);
+    }
+  }
+  return datas.join("\n");
+}
+
+// ---------- schema mirror (what opencode's router will accept) ----------
+// analyzeEvent(joinedData) -> {kind:"pass"} | {kind:"repair", text} | {kind:"invalid", reason}
+// Mirrors the lenient openai-compatible-chat chunk schema: unknown keys are
+// allowed; known typed fields must have the right JSON types; error must be
+// an object with a string message; [DONE] / null / no-data always pass.
+function safeStringify(v) {
+  try { const s = JSON.stringify(v); return s === undefined ? String(v) : s; }
+  catch { return String(v); }
+}
+
+function analyzeEvent(data) {
+  if (data === "") return { kind: "pass" }; // comment/field-only event
+  if (data === "[DONE]") return { kind: "pass" };
+  if (data === "null") return { kind: "pass" }; // opencode's SSE framing skips it
+  let v;
+  try { v = JSON.parse(data); } catch { return { kind: "invalid", reason: "not-json" }; }
+  if (v === null) return { kind: "pass" };
+  if (typeof v !== "object") return { kind: "invalid", reason: `not-object(${typeof v})` };
+  if (Array.isArray(v)) return { kind: "invalid", reason: "array" };
+
+  let copy = null;
+  const ensure = () => { if (!copy) copy = JSON.parse(JSON.stringify(v)); return copy; };
+
+  // error: must be {message: string, ...}
+  if (v.error !== undefined && v.error !== null) {
+    const e = v.error;
+    if (typeof e !== "object" || Array.isArray(e)) {
+      const r = ensure();
+      r.error = { message: typeof e === "string" ? e : safeStringify(e), type: "upstream_error", code: "proxy_normalized" };
+    } else if (typeof e.message !== "string") {
+      const r = ensure();
+      r.error = { ...e, message: e.message === undefined || e.message === null ? "upstream error" : safeStringify(e.message) };
+    }
+  }
+
+  const t = copy || v;
+
+  // choices: array of objects; delta typed fields
+  if (t.choices !== undefined && t.choices !== null) {
+    if (!Array.isArray(t.choices)) return { kind: "invalid", reason: "choices-not-array" };
+    for (let ci = 0; ci < t.choices.length; ci++) {
+      const c = t.choices[ci];
+      if (c === null || typeof c !== "object" || Array.isArray(c)) return { kind: "invalid", reason: "choice-not-object" };
+      const d = c.delta;
+      if (d !== undefined && d !== null) {
+        if (typeof d !== "object" || Array.isArray(d)) return { kind: "invalid", reason: "delta-not-object" };
+        for (const k of ["content", "reasoning", "reasoning_text", "reasoning_content", "refusal", "role"]) {
+          const val = d[k];
+          if (val === null) {
+            // semantically-absent; strip so the decode cannot reject it
+            const r = ensure();
+            const rc = r.choices?.[ci];
+            if (rc && rc.delta) delete rc.delta[k];
+          } else if (val !== undefined && typeof val !== "string") {
+            return { kind: "invalid", reason: `delta.${k}-not-string` };
+          }
+        }
+        if (d.tool_calls !== undefined && d.tool_calls !== null) {
+          if (!Array.isArray(d.tool_calls)) return { kind: "invalid", reason: "tool_calls-not-array" };
+          for (const tc of d.tool_calls) {
+            if (tc === null || typeof tc !== "object" || Array.isArray(tc)) return { kind: "invalid", reason: "tool_call-not-object" };
+            if (tc.function !== undefined && tc.function !== null && (typeof tc.function !== "object" || Array.isArray(tc.function))) {
+              return { kind: "invalid", reason: "tool_call.function-not-object" };
+            }
+          }
+        }
+      }
+      if (c.finish_reason !== undefined && c.finish_reason !== null && typeof c.finish_reason !== "string") {
+        return { kind: "invalid", reason: "finish_reason-not-string" };
+      }
+      if (c.native_finish_reason !== undefined && c.native_finish_reason !== null && typeof c.native_finish_reason !== "string") {
+        return { kind: "invalid", reason: "native_finish_reason-not-string" };
+      }
+    }
+  }
+
+  // usage: object; token counts numeric
+  const u = t.usage;
+  if (u !== undefined && u !== null) {
+    if (typeof u !== "object" || Array.isArray(u)) return { kind: "invalid", reason: "usage-not-object" };
+    for (const k of ["prompt_tokens", "completion_tokens", "total_tokens"]) {
+      if (u[k] !== undefined && u[k] !== null && typeof u[k] !== "number") return { kind: "invalid", reason: `usage.${k}-not-number` };
+    }
+  }
+
+  if (copy) return { kind: "repair", text: JSON.stringify(copy) };
+  return { kind: "pass" };
+}
+
+// An in-band provider error payload: {"error": ...} — pre-commit this means
+// the attempt failed; post-commit it is forwarded (valid schema shape).
+function isErrorPayload(data) {
+  if (!data.startsWith("{")) return false;
+  try {
+    const j = JSON.parse(data);
+    return j && typeof j === "object" && !Array.isArray(j) && j.error !== undefined && j.error !== null;
+  } catch { return false; }
+}
+
+// Reshape a non-stream chat.completion (stream:true answered with JSON) into
+// a single chunk opencode's chat protocol can decode (tinyproxy v13 lesson).
+function bulkToChunkJSON(obj) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
+  if (!Array.isArray(obj.choices)) return null;
+  return JSON.stringify({
+    id: obj.id,
+    object: "chat.completion.chunk",
+    created: obj.created,
+    model: obj.model,
+    choices: obj.choices.map((c, i) => ({
+      index: c?.index ?? i,
+      delta: c?.message && typeof c.message === "object" ? c.message : {},
+      finish_reason: c?.finish_reason ?? "stop",
+    })),
+    usage: obj.usage,
+  });
+}
+
+// ---------- helpers ----------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const RL_BUDGET_MS = Number(process.env.LOGFARE_PROXY_RL_BUDGET_MS) || RATE_LIMIT_BUDGET_MS_DEFAULT;
+const RL_BACKOFF = (process.env.LOGFARE_PROXY_RL_BACKOFF_MS || "").split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => n > 0);
+const rateLimitBackoffMs = (streak) => (RL_BACKOFF.length ? RL_BACKOFF[Math.min(streak, RL_BACKOFF.length - 1)] : RATE_LIMIT_BACKOFF_DEFAULT[Math.min(streak, RATE_LIMIT_BACKOFF_DEFAULT.length - 1)]) || 30000;
+const HARD_BACKOFF = (process.env.LOGFARE_PROXY_BACKOFF_MS || "").split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => n > 0);
+const backoffMs = (retryCount) => (HARD_BACKOFF.length ? HARD_BACKOFF[Math.min(retryCount, HARD_BACKOFF.length - 1)] : BACKOFF_MS[Math.min(retryCount, BACKOFF_MS.length - 1)]) || 3000;
+
+// node:http(s) upstream call. Bun's fetch AUTO-RETRIES on mid-body
+// connection death and concatenates the retried bytes into the same response
+// body (observed: content duplicated 3x downstream). Raw sockets deliver
+// exactly-once and give full retry control.
+function upstreamRequest(target, opts) {
+  return new Promise((resolve, reject) => {
+    let url;
+    try { url = new URL(target); } catch (e) { reject(e); return; }
+    const isHttps = url.protocol === "https:";
+    const mod = isHttps ? httpsRequest : httpRequest;
+    const r = mod({
+      method: opts.method || "GET",
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: url.pathname + url.search,
+      headers: opts.headers || {},
+      // Dedicated socket per attempt: SSE responses are abandoned the moment
+      // [DONE] arrives (never drained), and a pooled keep-alive socket with
+      // unread tail bytes poisons the NEXT request — its parser re-delivers
+      // stale body bytes (observed: duplicated SSE events with stray CRLF
+      // framing). A fresh socket per request makes that impossible.
+      agent: false,
+    }, (im) => { clearTimeout(attemptTimer); resolve(im); });
+    r.on("error", (e) => { clearTimeout(attemptTimer); reject(e); });
+    const attemptTimer = setTimeout(() => {
+      try { r.destroy(new Error("attempt-timeout")); } catch {}
+    }, ATTEMPT_TIMEOUT_MS);
+    try { attemptTimer.unref?.(); } catch {}
+    if (opts.body) r.write(opts.body);
+    r.end();
+  });
+}
+
+// One chunk from an IncomingMessage with an idle deadline. Resolves null on
+// end, rejects on error/timeout. Listeners are attached EXACTLY ONCE per
+// response (attach/detach per read loses 'end'/'error' events that fire in
+// the gap between reads — the reader then hangs until the idle timeout,
+// which stalled the whole request for minutes). The buffer is drained one
+// chunk at a time from a captured queue; data arriving between awaits is
+// parked there, never lost.
+function makeReader(im) {
+  const queue = [];
+  let wake = null; // pending resolver for the next awaited chunk
+  let done = false;
+  let error = null;
+  const onData = (chunk) => {
+    if (wake) { const w = wake; wake = null; w.resolve(chunk); }
+    else queue.push(chunk);
+  };
+  const onEnd = () => {
+    done = true;
+    if (wake) { const w = wake; wake = null; w.resolve(null); }
+  };
+  const onErr = (e) => {
+    error = e || new Error("stream error");
+    if (wake) { const w = wake; wake = null; w.reject(error); }
+  };
+  const timer = setInterval(() => {
+    if (wake && wake.deadline < Date.now()) {
+      const w = wake; wake = null;
+      try { im.destroy(new Error("idle-timeout")); } catch {}
+      w.reject(new Error("idle-timeout"));
+    }
+  }, 250);
+  try { timer.unref?.(); } catch {}
+  im.on("data", onData);
+  im.on("end", onEnd);
+  im.on("error", onErr);
+  return function readWithIdle(ms) {
+    return new Promise((resolve, reject) => {
+      if (queue.length > 0) { resolve(queue.shift()); return; }
+      if (error) { reject(error); return; }
+      if (done) { resolve(null); return; }
+      wake = { resolve, reject, deadline: Date.now() + ms };
+    });
+  };
+}
+
+async function consumeBody(im) {
+  const read = makeReader(im);
+  const parts = [];
+  for (;;) {
+    const chunk = await read(IDLE_MS);
+    if (chunk === null) break;
+    parts.push(chunk);
+  }
+  return Buffer.concat(parts).toString("utf8");
+}
+
+function parseRetryAfterMs(v) {
+  if (typeof v !== "string" || !v.trim()) return 0;
+  const s = v.trim();
+  if (/^\d+$/.test(s)) return Math.min(parseInt(s, 10) * 1000, RETRY_AFTER_CAP_MS);
+  const d = Date.parse(s);
+  if (Number.isNaN(d)) return 0;
+  return Math.min(Math.max(0, d - Date.now()), RETRY_AFTER_CAP_MS);
+}
+
+function snippet(s, n = 220) {
+  const one = String(s).replace(/\s+/g, " ");
+  return one.length > n ? one.slice(0, n) + "…" : one;
+}
+
+function buildForwardHeaders(inbound, extra) {
+  const h = {};
+  for (const [k, v] of Object.entries(inbound)) {
+    const lk = k.toLowerCase();
+    if (["host", "connection", "content-length", "accept-encoding", "expect", "keep-alive",
+      "transfer-encoding", "upgrade", "proxy-connection", "x-lf-key", "x-lf-upstream"].includes(lk)) continue;
+    h[k] = v;
+  }
+  return Object.assign(h, extra || {});
+}
+
+function pickResponseHeaders(upstreamHeaders, retryCount) {
+  const h = {};
+  for (const [k, v] of Object.entries(upstreamHeaders || {})) {
+    const lk = k.toLowerCase();
+    if (["content-length", "content-encoding", "transfer-encoding", "connection", "keep-alive",
+      "content-type"].includes(lk)) continue;
+    h[k] = v;
+  }
+  h["content-type"] = upstreamHeaders?.["content-type"] || "text/event-stream";
+  h["x-lf-retries"] = String(retryCount);
+  h["x-accel-buffering"] = "no";
+  h["cache-control"] = "no-cache";
+  return h;
+}
+
+// ---------- the proxy server ----------
+async function startServer(upstreamBase, port, mode) {
+  async function handle(req, res) {
+    const started = Date.now();
+    const pathAndQuery = req.url || "/";
+    if (pathAndQuery === "/healthz" || pathAndQuery === "/healthz/") {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("logfare-proxy OK");
+      return;
+    }
+
+    // buffer the request body (retries need a replayable body)
+    const chunks = [];
+    let reqSize = 0;
+    req.on("data", (c) => { chunks.push(c); reqSize += c.length; });
+    await new Promise((resolve) => req.on("end", resolve));
+    const rawBody = Buffer.concat(chunks);
+
+    // stream wanted? (chat completions with stream:true)
+    let wantsStream = false;
+    let model = "?";
+    try {
+      const j = JSON.parse(rawBody.toString("utf8"));
+      wantsStream = j?.stream === true;
+      model = j?.model || "?";
+    } catch {}
+
+    // resolve upstream + key (header overrides stripped before forward)
+    const upOverride = req.headers["x-lf-upstream"];
+    const base = (typeof upOverride === "string" && upOverride.trim()) ? upOverride.trim().replace(/\/+$/, "") : upstreamBase;
+    // The client hits http://127.0.0.1:17330/v1/... and the upstream base
+    // already carries /v1 — appending both yielded /v1/v1/... (404 from
+    // logfare). Strip the upstream base's own path prefix from the incoming
+    // path exactly once.
+    let suffix = pathAndQuery || "/";
+    try {
+      const basePrefix = new URL(base).pathname.replace(/\/+$/, "");
+      if (basePrefix && basePrefix !== "/") {
+        if (suffix === basePrefix) suffix = "/";
+        else if (suffix.startsWith(basePrefix + "/")) suffix = suffix.slice(basePrefix.length);
+      }
+    } catch {}
+    let auth = req.headers["authorization"];
+    if (req.headers["x-lf-key"]) {
+      const k = String(req.headers["x-lf-key"]).trim();
+      auth = /^bearer /i.test(k) ? k : `Bearer ${k}`;
+    }
+    if (!auth && process.env.LOGFARE_PROXY_KEY) auth = `Bearer ${process.env.LOGFARE_PROXY_KEY}`;
+    const fwdHeaders = buildForwardHeaders(req.headers, auth ? { authorization: auth } : {});
+    const target = `${base}${suffix}`;
+    const isStreamCt = (ct) => String(ct || "").toLowerCase().includes("text/event-stream");
+
+    log(`req ${req.method} ${pathAndQuery} model=${model} stream=${wantsStream} bytes=${reqSize}`);
+
+    let clientGone = false;
+    res.on("close", () => { clientGone = true; });
+    let lastStatus = null;
+    let lastStatusBody = null;
+    let lastFailure = "unknown";
+
+    const rlDeadline = Date.now() + RL_BUDGET_MS;
+    let hardFailures = 0;
+    let rlStreak = 0;
+    let attemptsUsed = 0;
+    for (let attempt = 1; ; attempt++) {
+      attemptsUsed = attempt;
+      if (clientGone) { log(`req ${pathAndQuery}: client gone, stop`); return; }
+      const retryCount = attempt - 1;
+      let up = null;
+      try {
+        // raw socket upstream call — never reuse a consumed init (tinyproxy v10)
+        const reqHeaders = { ...fwdHeaders };
+        if (reqSize > 0) reqHeaders["content-length"] = String(reqSize);
+        up = await upstreamRequest(target, { method: req.method, headers: reqHeaders, body: reqSize > 0 ? rawBody : undefined });
+        lastStatus = up.statusCode;
+
+        if (lastStatus >= 400) {
+          const text = await consumeBody(up);
+          lastStatusBody = text;
+          lastFailure = `status ${lastStatus}: ${snippet(text)}`;
+          const retryable = lastStatus === 429 || lastStatus === 408 || lastStatus >= 500;
+          if (!retryable) { log(`attempt ${attempt}: ${lastFailure}`); break; } // deterministic 4xx: pass through now
+          const patient = lastStatus === 429 || lastStatus === 413
+            || (lastStatus >= 400 && (RATE_LIMIT_RE.test(text) || PATIENT_SIZE_RE.test(text)));
+          if (patient) {
+            // token-per-minute etc: retry until it works (budget-bound)
+            const wait = parseRetryAfterMs(up.headers["retry-after"]) || rateLimitBackoffMs(rlStreak++);
+            if (Date.now() + wait >= rlDeadline) { log(`attempt ${attempt}: ${lastFailure} — rate-limit budget exhausted`); break; }
+            log(`attempt ${attempt}: ${lastFailure} — rate-limited, retrying in ${Math.round(wait / 1000)}s`);
+            await sleep(wait);
+            continue;
+          }
+          log(`attempt ${attempt}: ${lastFailure}`);
+          hardFailures++;
+          if (hardFailures > MAX_RETRIES) break;
+          await sleep(parseRetryAfterMs(up.headers["retry-after"]) || backoffMs(retryCount));
+          continue;
+        }
+
+        const ct = up.headers["content-type"] || "";
+
+        // non-stream request: pass bytes through as-is
+        if (!wantsStream) {
+          const headers = pickResponseHeaders(up.headers, retryCount);
+          res.writeHead(lastStatus, headers);
+          const readUp = makeReader(up);
+          for (;;) {
+            const chunk = await readUp(IDLE_MS);
+            if (chunk === null) break;
+            if (clientGone) { try { up.destroy(); } catch {} break; }
+            res.write(chunk);
+          }
+          res.end();
+          try { up.destroy(); } catch {} // release the dedicated socket
+          log(`req ${pathAndQuery}: proxied non-stream ${lastStatus} in ${Date.now() - started}ms`);
+          return;
+        }
+
+        // stream requested but upstream answered non-SSE (bulk-JSON to SSE, tinyproxy v13)
+        if (!isStreamCt(ct)) {
+          const text = await consumeBody(up);
+          let payload = null;
+          if (lastStatus === 200) {
+            try {
+              const j = JSON.parse(text);
+              // ONLY a real completion converts. A 200-JSON ERROR body (e.g.
+              // Cloudflare AiError 8006 "request body exceeds the maximum
+              // supported size") is NOT a chunk — forwarding it as one is
+              // exactly what produced "Invalid logfare/... stream event"
+              // (opencode decodes the error-shaped object, fails the union,
+              // and blames the route). Fail the attempt and retry instead.
+              payload = bulkToChunkJSON(j);
+            } catch { payload = null; }
+          }
+          if (payload !== null) {
+            log(`attempt ${attempt}: bulk-JSON (ct=${ct}) converted to SSE`);
+            const headers = pickResponseHeaders(up.headers, retryCount);
+            headers["content-type"] = "text/event-stream";
+            res.writeHead(200, headers);
+            res.write(`data: ${payload}\n\n`);
+            res.write("data: [DONE]\n\n");
+            res.end();
+            try { up.destroy(); } catch {}
+            log(`req ${pathAndQuery}: bulk-JSON converted, done in ${Date.now() - started}ms`);
+            return;
+          }
+          lastFailure = `stream wanted but upstream ct=${ct} status=${lastStatus}: ${snippet(text)}`;
+          log(`attempt ${attempt}: ${lastFailure}`);
+          // 200 + JSON error body (AiError 8006 "request body exceeds the
+          // maximum supported size", rate-limit JSON): flaky per attempt —
+          // the SAME body succeeds on a later retry — so retry patiently,
+          // budget-bound, never counting against the 10 hard retries.
+          const patientBody = lastStatus === 200 && (RATE_LIMIT_RE.test(text) || PATIENT_SIZE_RE.test(text));
+          if (patientBody) {
+            const wait = parseRetryAfterMs(up.headers["retry-after"]) || rateLimitBackoffMs(rlStreak++);
+            if (Date.now() + wait >= rlDeadline) { log(`patient budget exhausted`); break; }
+            log(`retrying in ${Math.round(wait / 1000)}s (patient: 200-error body)`);
+            await sleep(wait);
+            continue;
+          }
+          hardFailures++;
+          if (hardFailures > MAX_RETRIES) break;
+          await sleep(backoffMs(retryCount));
+          continue;
+        }
+
+        // ===== SSE validation path =====
+        const headers = pickResponseHeaders(up.headers, retryCount);
+        headers["content-type"] = "text/event-stream";
+        let committed = false;
+        let bailed = false;
+        let bailedRLFlag = false;
+        let drops = 0;
+        let sawDone = false;
+        let lastErr = null;
+        const commit = () => { if (!committed) { res.writeHead(200, headers); committed = true; } };
+        const ev = makeEventizer();
+        const decoder = new TextDecoder();
+        const readUp = makeReader(up);
+        let firstByteSeen = false;
+
+        // returns {bail, rateLimited} (pre-commit failure) or null
+        const handleEvent = (raw) => {
+          const data = eventData(raw);
+          const verdict = analyzeEvent(data);
+          if (verdict.kind === "invalid") {
+            if (!committed) return { bail: `invalid event pre-commit: ${verdict.reason}: ${snippet(data)}`, rateLimited: false };
+            drops++;
+            log(`POST-commit DROP (${verdict.reason}): ${snippet(data)}`);
+            return null;
+          }
+          if (isErrorPayload(data) && !committed) {
+            return { bail: `error event pre-commit: ${snippet(data)}`, rateLimited: RATE_LIMIT_RE.test(data) || PATIENT_SIZE_RE.test(data), errorBody: data };
+          }
+          if (verdict.kind === "repair") {
+            commit();
+            dbg(`fwd repair: ${snippet(verdict.text, 80)}`);
+            res.write(`data: ${verdict.text}\n\n`);
+            return null;
+          }
+          commit();
+          dbg(`fwd raw: ${snippet(data, 80)}`);
+          res.write(raw + "\n\n");
+          if (data === "[DONE]") sawDone = true;
+          return null;
+        };
+
+        try {
+          for (;;) {
+            const deadline = firstByteSeen ? IDLE_MS : FIRST_BYTE_MS;
+            const chunk = await readUp(deadline);
+            if (chunk === null) break;
+            firstByteSeen = true;
+            if (clientGone) { lastErr = "client-gone"; break; }
+            dbg(`up chunk(${chunk.length}): ${snippet(chunk.toString("utf8"), 160)}`);
+            const events = ev.feed(decoder.decode(chunk, { stream: true }));
+            let bail = null;
+            let bailRL = false;
+            for (const raw of events) {
+              const r = handleEvent(raw);
+              if (r) { bail = r.bail; bailRL = r.rateLimited; if (r.errorBody) lastStatusBody = r.errorBody; break; }
+              if (sawDone) break;
+            }
+            if (bail) { lastFailure = bail; log(`attempt ${attempt}: ${bail}`); bailed = true; bailedRLFlag = bailRL; break; }
+            if (sawDone) break;
+          }
+          if (!bailed && !sawDone) {
+            for (const raw of ev.flush()) {
+              const r = handleEvent(raw);
+              if (r) { lastFailure = r.bail; if (r.errorBody) lastStatusBody = r.errorBody; log(`attempt ${attempt}: ${r.bail}`); bailed = true; bailedRLFlag = r.rateLimited; break; }
+            }
+          }
+        } catch (streamErr) {
+          lastErr = streamErr;
+          log(`attempt ${attempt}: stream error: ${streamErr?.message || streamErr}`);
+        }
+        if (committed) {
+          // post-commit: cannot retry without duplicating client-visible
+          // content — heal the tail instead (tinyproxy pattern).
+          if (!sawDone) {
+            const msg = lastErr === "client-gone" ? null
+              : lastErr ? `Upstream stream error: ${lastErr?.message || lastErr}`
+              : "Upstream closed the stream without [DONE]";
+            if (msg) {
+              try { res.write(`data: ${JSON.stringify({ error: { message: msg, type: "proxy_error", code: "proxy_stream_error" } })}\n\n`); } catch {}
+              log(`post-commit synth error: ${msg}`);
+            }
+            try { res.write("data: [DONE]\n\n"); } catch {}
+          }
+          try { res.end(); } catch {}
+          try { up.destroy(); } catch {} // release the dedicated socket (never pooled)
+          log(`req ${pathAndQuery}: stream done retries=${retryCount} drops=${drops} sawDone=${sawDone} in ${Date.now() - started}ms`);
+          return;
+        }
+
+        // pre-commit failure -> retry
+        try { up && up.destroy(); } catch {} // discard the failed attempt's socket
+        if (clientGone) { log(`req ${pathAndQuery}: client gone pre-commit, stop`); return; }
+        if (!bailed) {
+          lastFailure = `stream ended with no valid events (err=${lastErr?.message || lastErr || "none"})`;
+        }
+        log(`attempt ${attempt}: pre-commit failure: ${lastFailure}`);
+        if (bailed && bailedRLFlag) {
+          // rate-limited in-stream: patient retry until it works (budget-bound)
+          const wait = rateLimitBackoffMs(rlStreak++);
+          if (Date.now() + wait >= rlDeadline) { log(`rate-limit budget exhausted`); break; }
+          log(`retrying in ${Math.round(wait / 1000)}s (rate limit)`);
+          await sleep(wait);
+          continue;
+        }
+        hardFailures++;
+        if (hardFailures > MAX_RETRIES) break;
+        await sleep(backoffMs(retryCount));
+      } catch (err) {
+        lastFailure = `attempt error: ${err?.message || err}`;
+        log(`attempt ${attempt}: ${lastFailure}`);
+        try { up && up.destroy(); } catch {}
+        if (clientGone) return;
+        hardFailures++;
+        if (hardFailures > MAX_RETRIES) break;
+        await sleep(backoffMs(retryCount));
+      }
+    }
+
+    // give-up path (only after MAX_RETRIES): surface the last failure
+    log(`req ${pathAndQuery}: GIVING UP (attempts=${attemptsUsed}, hardFailures=${hardFailures}): ${lastFailure}`);
+    // 200 with an in-band JSON error body (e.g. logfare/Cloudflare AiError
+    // 8006 "request body exceeds the maximum supported size"): emit it as a
+    // schema-VALID error event so the turn fails with the REAL message —
+    // never as "Invalid logfare/openai-compatible-chat stream event".
+    if (lastStatus === 200 && lastStatusBody) {
+      const trimmed = lastStatusBody.trim();
+      if (isErrorPayload(trimmed)) {
+        const probe = analyzeEvent(trimmed);
+        const text = probe.kind === "repair" ? probe.text : trimmed;
+        try { res.writeHead(200, { "content-type": "text/event-stream", "x-lf-retries": String(Math.max(0, attemptsUsed - 1)) }); } catch {}
+        try { res.write(`data: ${text}\n\n`); res.write("data: [DONE]\n\n"); res.end(); } catch {}
+        return;
+      }
+    }
+    if (lastStatus && lastStatus >= 400 && lastStatusBody !== null) {
+      try { res.writeHead(lastStatus, { "content-type": "application/json" }); } catch {}
+      try { res.end(lastStatusBody); } catch {}
+      return;
+    }
+    try {
+      res.writeHead(200, { "content-type": "text/event-stream", "x-lf-retries": String(MAX_RETRIES) });
+      res.write(`data: ${JSON.stringify({ error: { message: `logfare-proxy: giving up after ${MAX_RETRIES} retries — last failure: ${lastFailure}`, type: "proxy_error", code: "proxy_retries_exhausted" } })}\n\n`);
+      res.write("data: [DONE]\n\n");
+      res.end();
+    } catch {
+      try { if (!res.headersSent) res.writeHead(502, { "content-type": "text/plain" }); res.end(`logfare-proxy: ${lastFailure}`); } catch {}
+    }
+  }
+
+  const server = createServer();
+  server.on("request", (req, res) => {
+    handle(req, res).catch((err) => {
+      log(`handler crash: ${err?.stack || err}`);
+      try { if (!res.headersSent) res.writeHead(502, { "content-type": "text/plain" }); res.end(`logfare-proxy error: ${err?.message || err}`); } catch {}
+    });
+  });
+  server.on("checkContinue", (req, res) => {
+    try { res.writeContinue(); } catch {}
+    handle(req, res).catch(() => {});
+  });
+  server.on("clientError", (err, socket) => {
+    try { socket.end("HTTP/1.1 400 Bad Request\r\n\r\n"); } catch {}
+  });
+
+  // hot-reload safety (tinyproxy pattern): close a previous instance first
+  try {
+    const prev = globalThis.__logfareProxyServer;
+    globalThis.__logfareProxyServer = null;
+    if (prev) {
+      try { prev.closeAllConnections?.(); } catch {}
+      await new Promise((resolve) => { try { prev.close(resolve); } catch { resolve(); } });
+    }
+  } catch {}
+  globalThis.__logfareProxyServer = server;
+
+  const listen = () => {
+    server.listen(port, LISTEN_HOST, () => {
+      log(`listening (${mode}) on http://${LISTEN_HOST}:${port} -> ${upstreamBase}`);
+    });
+  };
+  server.on("error", (err) => {
+    if (err && err.code === "EADDRINUSE") {
+      log(`port ${port} busy — retrying every 5s (another logfare-proxy instance may be serving; takeover on release)`);
+      const t = setTimeout(listen, 5000);
+      try { t.unref?.(); } catch {}
+    } else {
+      log(`server error: ${err?.stack || err}`);
+    }
+  });
+  listen();
+
+  // Bun crash-proofing (tinyproxy v16.16): an unhandled rejection in a plugin
+  // can kill the whole opencode server — swallow and log instead.
+  if (!globalThis.__logfareProxyCrashGuards) {
+    globalThis.__logfareProxyCrashGuards = true;
+    process.on("unhandledRejection", (reason) => {
+      try { log(`swallowed unhandledRejection: ${(reason && (reason.stack || reason.message)) || reason}`); } catch {}
+    });
+    process.on("uncaughtException", (err) => {
+      try { log(`swallowed uncaughtException: ${(err && (err.stack || err.message)) || err}`); } catch {}
+    });
+  }
+}
+
+export default {
+  id: "logfare-proxy",
+  async setup(ctx) {
+    startServer(process.env.LOGFARE_PROXY_UPSTREAM || UPSTREAM_DEFAULT, Number(process.env.LOGFARE_PROXY_PORT) || PORT_DEFAULT, "plugin")
+      .catch((e) => log(`startServer failed: ${e?.stack || e}`));
+  },
+};
+
+if (import.meta.main) {
+  startServer(process.env.LOGFARE_PROXY_UPSTREAM || UPSTREAM_DEFAULT, Number(process.env.LOGFARE_PROXY_PORT) || PORT_DEFAULT, "standalone")
+    .catch((e) => log(`startServer failed: ${e?.stack || e}`));
+}
