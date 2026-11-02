@@ -100,6 +100,26 @@ If the vision call fails, the image is replaced with
 `[Image attached by the user — vision analysis unavailable]` so the turn still
 proceeds.
 
+> **Requirement — the target model must advertise image input.** OpenCode
+> filters attachments client-side: if the model's `capabilities.input` in
+> `opencode.json` is `["text"]`, the image is stripped from the request and
+> never reaches the proxy (nothing to hand off — the model just says it can't
+> see the image). For a text-only target like `glm-5.3`, declare it as:
+>
+> ```jsonc
+> "glm-5.3": {
+>   "capabilities": { "tools": true, "input": ["text", "image"], "output": ["text"] }
+> }
+> ```
+>
+> The proxy then captions the image and removes it before the upstream call, so
+> the real text-only model never receives image bytes. Capability changes need
+> an OpenCode restart (provider snapshot is cached).
+>
+> Verify with: `opencode run -m logfare/glm-5.3 --file=shot.png "what text is in the image?"`
+> The proxy log should show `non-text parts: image_url{type,image_url}` followed
+> by `vision handoff model=glm-5.3 images=1 analyzed=1`.
+
 ### Retry classes
 
 | Failure | Class | Behavior |

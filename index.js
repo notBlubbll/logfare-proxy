@@ -547,6 +547,22 @@ async function startServer(upstreamBase, port, mode) {
       model = reqJson?.model || "?";
     } catch {}
 
+    // shape diagnostic: log non-text content part types (never their payload)
+    if (reqJson) {
+      try {
+        const detail = [];
+        for (const m of (reqJson.messages || [])) {
+          if (!Array.isArray(m?.content)) continue;
+          for (const p of m.content) {
+            if (p && typeof p === "object" && p.type && p.type !== "text") {
+              detail.push(`${p.type}{${Object.keys(p).join(",")}}`);
+            }
+          }
+        }
+        if (detail.length) log(`non-text parts: ${detail.slice(0, 6).join(" ")}`);
+      } catch {}
+    }
+
     // resolve upstream + key (header overrides stripped before forward)
     const upOverride = req.headers["x-lf-upstream"];
     const base = (typeof upOverride === "string" && upOverride.trim()) ? upOverride.trim().replace(/\/+$/, "") : upstreamBase;

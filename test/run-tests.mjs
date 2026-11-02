@@ -1,4 +1,4 @@
-﻿// Test harness for logfare-proxy. Spawns:
+// Test harness for logfare-proxy. Spawns:
 //   - a mock upstream on 127.0.0.1:17999 (scenarios keyed by request "model")
 //   - the proxy (bun index.js) on 127.0.0.1:17331 with LOGFARE_PROXY_UPSTREAM
 // Then drives HTTP requests through the proxy and asserts behavior.
