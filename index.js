@@ -47,6 +47,11 @@
 //      - 200 + JSON error bodies are failures, never converted to chunks
 //        (that conversion was the "Invalid ... stream event" producer);
 //      - give-up emits the real upstream error as a schema-valid SSE event.
+// rev: 2.1 — memory-leak fix: the per-response idle watchdog interval in
+//      makeReader never stopped on terminal paths (up.destroy() after [DONE]
+//      emits 'close', not 'error'/'end'), leaking one interval + its closures
+//      per response (~2GB RSS / 8h observed). Timer now cleared on 'close',
+//      'end' and 'error'.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -435,19 +440,29 @@ function makeReader(im) {
   let wake = null; // pending resolver for the next awaited chunk
   let done = false;
   let error = null;
+  // Memory-leak fix: this interval previously ran for the process lifetime —
+  // one per response — because `up.destroy()` after [DONE] emits 'close'
+  // (not 'error', not 'end'), so nothing ever cleared it. ~2GB RSS after 8h
+  // on one host. It now dies with the socket via the 'close' handler, and
+  // 'end'/'error' clear it explicitly.
+  let timer = null;
+  const killTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
   const onData = (chunk) => {
     if (wake) { const w = wake; wake = null; w.resolve(chunk); }
     else queue.push(chunk);
   };
   const onEnd = () => {
+    killTimer();
     done = true;
     if (wake) { const w = wake; wake = null; w.resolve(null); }
   };
   const onErr = (e) => {
+    killTimer();
     error = e || new Error("stream error");
     if (wake) { const w = wake; wake = null; w.reject(error); }
   };
-  const timer = setInterval(() => {
+  // The success path (up.destroy() after [DONE]) terminates via 'close' only.
+  timer = setInterval(() => {
     if (wake && wake.deadline < Date.now()) {
       const w = wake; wake = null;
       try { im.destroy(new Error("idle-timeout")); } catch {}
@@ -455,6 +470,7 @@ function makeReader(im) {
     }
   }, 250);
   try { timer.unref?.(); } catch {}
+  im.on("close", killTimer); // every socket teardown path, incl. destroy()
   im.on("data", onData);
   im.on("end", onEnd);
   im.on("error", onErr);
