@@ -1,0 +1,113 @@
+{
+  "logfare": {
+    "name": "Logfare",
+    "package": "@opencode-ai/ai/providers/openai-compatible",
+    "settings": {
+      "baseURL": "https://logfare.ai/v1",
+      "apiKey": "REPLACE_ME",
+      "timeout": 1800000,
+      "headerTimeout": 600000,
+      "chunkTimeout": 600000
+    },
+    "models": {
+      "glm-5.3": {
+        "name": "GLM 5.3",
+        "capabilities": { "tools": true, "input": ["text", "image"], "output": ["text"] },
+        "compatibility": { "reasoningField": "reasoning" },
+        "limit": { "context": 750000, "output": 32768 },
+        "variants": [
+          { "id": "low", "settings": { "reasoningEffort": "low" } },
+          { "id": "high", "settings": { "reasoningEffort": "high" } },
+          { "id": "xhigh", "settings": { "reasoningEffort": "xhigh" } },
+          { "id": "max", "settings": { "reasoningEffort": "max" } }
+        ]
+      },
+      "glm-5.3-flash": {
+        "name": "GLM 5.3 Flash",
+        "capabilities": { "tools": true, "input": ["text", "image"], "output": ["text"] },
+        "compatibility": { "reasoningField": "reasoning" },
+        "limit": { "context": 1048576, "output": 32768 },
+        "variants": [
+          { "id": "low", "settings": { "reasoningEffort": "low" } },
+          { "id": "high", "settings": { "reasoningEffort": "high" } },
+          { "id": "xhigh", "settings": { "reasoningEffort": "xhigh" } },
+          { "id": "max", "settings": { "reasoningEffort": "max" } }
+        ]
+      },
+      "glm-5.2": {
+        "name": "GLM 5.2",
+        "capabilities": { "tools": true, "input": ["text"], "output": ["text"] },
+        "compatibility": { "reasoningField": "reasoning" },
+        "limit": { "context": 1048576, "output": 32768 },
+        "variants": [
+          { "id": "low", "settings": { "reasoningEffort": "low" } },
+          { "id": "high", "settings": { "reasoningEffort": "high" } },
+          { "id": "xhigh", "settings": { "reasoningEffort": "xhigh" } },
+          { "id": "max", "settings": { "reasoningEffort": "max" } }
+        ]
+      },
+      "logfare/auto": {
+        "name": "Logfare Auto",
+        "capabilities": { "tools": false, "input": ["text", "image"], "output": ["text"] },
+        "limit": { "context": 262144 }
+      },
+      "gemma-4-26b": {
+        "name": "Gemma 4 26B",
+        "capabilities": { "tools": true, "input": ["text", "image"], "output": ["text"] },
+        "limit": { "context": 256000 }
+      },
+      "gemma-4-31b-it": {
+        "name": "Gemma 4 31B IT",
+        "capabilities": { "tools": true, "input": ["text", "image"], "output": ["text"] },
+        "limit": { "context": 262144 }
+      },
+      "kimi-k2.6": {
+        "name": "Kimi K2.6",
+        "capabilities": { "tools": true, "input": ["text", "image"], "output": ["text"] },
+        "compatibility": { "reasoningField": "reasoning" },
+        "limit": { "context": 262144 }
+      },
+      "kimi-k2.7-code": {
+        "name": "Kimi K2.7 Code",
+        "capabilities": { "tools": true, "input": ["text", "image"], "output": ["text"] },
+        "compatibility": { "reasoningField": "reasoning" },
+        "limit": { "context": 262144 }
+      },
+      "qwen-3.8-27b": {
+        "name": "Qwen 3.8 27b",
+        "capabilities": { "tools": true, "input": ["text", "image"], "output": ["text"] },
+        "compatibility": { "reasoningField": "reasoning" },
+        "limit": { "context": 262144 }
+      },
+      "deepseek-v4.1-flash-1017": {
+        "name": "DeepSeek V4.1 Flash 1017",
+        "capabilities": { "tools": true, "input": ["text", "image"], "output": ["text"] },
+        "compatibility": { "reasoningField": "reasoning" },
+        "limit": { "context": 1048576 },
+        "variants": [
+          { "id": "low", "settings": { "reasoningEffort": "low" } },
+          { "id": "high", "settings": { "reasoningEffort": "high" } },
+          { "id": "xhigh", "settings": { "reasoningEffort": "max" } },
+          { "id": "max", "settings": { "reasoningEffort": "max" } }
+        ]
+      },
+      "economy/deepseek-v4.1-flash": {
+        "name": "DeepSeek V4.1 Flash (economy)",
+        "capabilities": { "tools": true, "input": ["text", "image"], "output": ["text"] },
+        "compatibility": { "reasoningField": "reasoning_content" },
+        "limit": { "context": 1048576 }
+      },
+      "stealth/funfly": {
+        "name": "Funfly (stealth)",
+        "capabilities": { "tools": false, "input": ["text"], "output": ["text"] },
+        "limit": { "context": 14336 }
+      },
+      "stealth/autistic-parrot": {
+        "name": "Autistic Parrot (stealth)",
+        "capabilities": { "tools": false, "input": ["text"], "output": ["text"] },
+        "compatibility": { "reasoningField": "reasoning" },
+        "limit": { "context": 24576 }
+      }
+    }
+  }
+}
