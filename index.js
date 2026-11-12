@@ -52,6 +52,15 @@
 //      emits 'close', not 'error'/'end'), leaking one interval + its closures
 //      per response (~2GB RSS / 8h observed). Timer now cleared on 'close',
 //      'end' and 'error'.
+// rev: 2.2 — header-timeout coverage: for streaming requests the proxy now
+//      sends SSE response headers immediately and emits `: keepalive` comments
+//      every 15s so the client never times out waiting for headers while the
+//      proxy is running vision handoff or retrying pre-commit upstream attempts.
+//      Pre-commit retries continue internally against fresh upstream attempts as
+//      long as no real data event has been committed to the client; only
+//      keepalive comments flow meanwhile. This prevents "Timed out waiting for
+//      response headers" without weakening stream validation (invalid events are
+//      still never forwarded).
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -112,6 +121,8 @@ function visionCacheSet(k, text) {
 const FIRST_BYTE_MS = 120000; // pre-commit: time to first event
 const IDLE_MS = 300000; // max gap between SSE events
 const ATTEMPT_TIMEOUT_MS = 1800000; // per attempt, mirrors provider timeout
+const KEEPALIVE_MS = 15000; // SSE comment keepalive while headers sent but no data committed
+const EARLY_HEADER_MS = 20000; // send SSE headers+keepalives if no data committed within this window (prevents client header timeout)
 const LOG_MAX_BYTES = 2 * 1024 * 1024;
 
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -579,6 +590,63 @@ async function startServer(upstreamBase, port, mode) {
       } catch {}
     }
 
+    let clientGone = false;
+    res.on("close", () => { clientGone = true; });
+
+    // Header-timeout coverage: for streaming requests, if no real data is
+    // committed within EARLY_HEADER_MS (vision handoff or pre-commit retries
+    // taking long), send SSE headers and emit keepalive comments so the client
+    // never times out waiting for headers. Only comments flow until a real,
+    // validated data event is committed; pre-commit retries can still continue
+    // internally as long as no data has been written. Fast responses keep the
+    // original behavior (headers/status/retry-count set at commit/give-up).
+    let earlyStream = false;
+    let dataCommitted = false; // first real (non-comment) event written
+    let streamEnded = false;
+    let keepaliveTimer = null;
+    let earlyHeaderTimer = null;
+    const stopKeepalive = () => { if (keepaliveTimer) { clearInterval(keepaliveTimer); keepaliveTimer = null; } };
+    const stopEarlyHeaderTimer = () => { if (earlyHeaderTimer) { clearTimeout(earlyHeaderTimer); earlyHeaderTimer = null; } };
+    const sendKeepalive = () => {
+      if (clientGone || streamEnded || dataCommitted) { stopKeepalive(); return; }
+      try { res.write(": keepalive\n\n"); } catch {}
+    };
+    const startEarlyStream = () => {
+      if (!wantsStream || earlyStream || res.headersSent || dataCommitted) return;
+      try {
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+          "x-accel-buffering": "no",
+        });
+        earlyStream = true;
+        keepaliveTimer = setInterval(sendKeepalive, KEEPALIVE_MS);
+        try { keepaliveTimer.unref?.(); } catch {}
+        log(`early SSE headers sent (keepalive active) to prevent client header timeout`);
+      } catch (e) {
+        log(`early stream header failed: ${e?.message || e}`);
+      }
+    };
+    const endStream = () => {
+      if (streamEnded) return;
+      streamEnded = true;
+      stopEarlyHeaderTimer();
+      stopKeepalive();
+      try { res.end(); } catch {}
+    };
+    const ensureStreamHeaders = (upHeaders, retryCount) => {
+      if (res.headersSent) return;
+      stopEarlyHeaderTimer();
+      const headers = pickResponseHeaders(upHeaders || {}, retryCount || 0);
+      headers["content-type"] = "text/event-stream";
+      try { res.writeHead(200, headers); } catch {}
+    };
+
+    if (wantsStream) {
+      earlyHeaderTimer = setTimeout(() => { earlyHeaderTimer = null; startEarlyStream(); }, EARLY_HEADER_MS);
+      try { earlyHeaderTimer.unref?.(); } catch {}
+    }
+
     // resolve upstream + key (header overrides stripped before forward)
     const upOverride = req.headers["x-lf-upstream"];
     const base = (typeof upOverride === "string" && upOverride.trim()) ? upOverride.trim().replace(/\/+$/, "") : upstreamBase;
@@ -617,6 +685,7 @@ async function startServer(upstreamBase, port, mode) {
           const origSize = reqSize;
           let analyzed = 0, cached = 0, failed = 0;
           for (const img of imgs) {
+            if (clientGone) break;
             const key = createHash("sha256").update(img.url).digest("hex");
             let desc = visionCacheGet(key);
             if (desc) {
@@ -650,9 +719,8 @@ async function startServer(upstreamBase, port, mode) {
     }
 
     log(`req ${req.method} ${pathAndQuery} model=${model} stream=${wantsStream} bytes=${reqSize}`);
+    if (clientGone) { stopEarlyHeaderTimer(); stopKeepalive(); log(`req ${pathAndQuery}: client gone, stop`); return; }
 
-    let clientGone = false;
-    res.on("close", () => { clientGone = true; });
     let lastStatus = null;
     let lastStatusBody = null;
     let lastFailure = "unknown";
@@ -663,7 +731,7 @@ async function startServer(upstreamBase, port, mode) {
     let attemptsUsed = 0;
     for (let attempt = 1; ; attempt++) {
       attemptsUsed = attempt;
-      if (clientGone) { log(`req ${pathAndQuery}: client gone, stop`); return; }
+      if (clientGone) { stopKeepalive(); log(`req ${pathAndQuery}: client gone, stop`); return; }
       const retryCount = attempt - 1;
       let up = null;
       try {
@@ -700,6 +768,8 @@ async function startServer(upstreamBase, port, mode) {
 
         // non-stream request: pass bytes through as-is
         if (!wantsStream) {
+          stopEarlyHeaderTimer();
+          stopKeepalive();
           const headers = pickResponseHeaders(up.headers, retryCount);
           res.writeHead(lastStatus, headers);
           const readUp = makeReader(up);
@@ -733,12 +803,12 @@ async function startServer(upstreamBase, port, mode) {
           }
           if (payload !== null) {
             log(`attempt ${attempt}: bulk-JSON (ct=${ct}) converted to SSE`);
-            const headers = pickResponseHeaders(up.headers, retryCount);
-            headers["content-type"] = "text/event-stream";
-            res.writeHead(200, headers);
+            ensureStreamHeaders(up.headers, retryCount);
+            dataCommitted = true;
+            stopKeepalive();
             res.write(`data: ${payload}\n\n`);
             res.write("data: [DONE]\n\n");
-            res.end();
+            endStream();
             try { up.destroy(); } catch {}
             log(`req ${pathAndQuery}: bulk-JSON converted, done in ${Date.now() - started}ms`);
             return;
@@ -766,13 +836,19 @@ async function startServer(upstreamBase, port, mode) {
         // ===== SSE validation path =====
         const headers = pickResponseHeaders(up.headers, retryCount);
         headers["content-type"] = "text/event-stream";
-        let committed = false;
         let bailed = false;
         let bailedRLFlag = false;
         let drops = 0;
         let sawDone = false;
         let lastErr = null;
-        const commit = () => { if (!committed) { res.writeHead(200, headers); committed = true; } };
+        const commitData = () => {
+          if (!dataCommitted) {
+            ensureStreamHeaders(up.headers, retryCount);
+            dataCommitted = true;
+            stopEarlyHeaderTimer();
+            stopKeepalive();
+          }
+        };
         const ev = makeEventizer();
         const decoder = new TextDecoder();
         const readUp = makeReader(up);
@@ -783,21 +859,21 @@ async function startServer(upstreamBase, port, mode) {
           const data = eventData(raw);
           const verdict = analyzeEvent(data);
           if (verdict.kind === "invalid") {
-            if (!committed) return { bail: `invalid event pre-commit: ${verdict.reason}: ${snippet(data)}`, rateLimited: false };
+            if (!dataCommitted) return { bail: `invalid event pre-commit: ${verdict.reason}: ${snippet(data)}`, rateLimited: false };
             drops++;
             log(`POST-commit DROP (${verdict.reason}): ${snippet(data)}`);
             return null;
           }
-          if (isErrorPayload(data) && !committed) {
+          if (isErrorPayload(data) && !dataCommitted) {
             return { bail: `error event pre-commit: ${snippet(data)}`, rateLimited: RATE_LIMIT_RE.test(data) || PATIENT_SIZE_RE.test(data), errorBody: data };
           }
           if (verdict.kind === "repair") {
-            commit();
+            commitData();
             dbg(`fwd repair: ${snippet(verdict.text, 80)}`);
             res.write(`data: ${verdict.text}\n\n`);
             return null;
           }
-          commit();
+          commitData();
           dbg(`fwd raw: ${snippet(data, 80)}`);
           res.write(raw + "\n\n");
           if (data === "[DONE]") sawDone = true;
@@ -833,7 +909,7 @@ async function startServer(upstreamBase, port, mode) {
           lastErr = streamErr;
           log(`attempt ${attempt}: stream error: ${streamErr?.message || streamErr}`);
         }
-        if (committed) {
+        if (dataCommitted) {
           // post-commit: cannot retry without duplicating client-visible
           // content — heal the tail instead (tinyproxy pattern).
           if (!sawDone) {
@@ -846,15 +922,16 @@ async function startServer(upstreamBase, port, mode) {
             }
             try { res.write("data: [DONE]\n\n"); } catch {}
           }
-          try { res.end(); } catch {}
+          endStream();
           try { up.destroy(); } catch {} // release the dedicated socket (never pooled)
           log(`req ${pathAndQuery}: stream done retries=${retryCount} drops=${drops} sawDone=${sawDone} in ${Date.now() - started}ms`);
           return;
         }
 
-        // pre-commit failure -> retry
+        // pre-commit failure -> retry (headers may already be sent as early
+        // SSE; only keepalives flowed so we can still try a fresh upstream)
         try { up && up.destroy(); } catch {} // discard the failed attempt's socket
-        if (clientGone) { log(`req ${pathAndQuery}: client gone pre-commit, stop`); return; }
+        if (clientGone) { stopEarlyHeaderTimer(); stopKeepalive(); log(`req ${pathAndQuery}: client gone pre-commit, stop`); return; }
         if (!bailed) {
           lastFailure = `stream ended with no valid events (err=${lastErr?.message || lastErr || "none"})`;
         }
@@ -874,7 +951,7 @@ async function startServer(upstreamBase, port, mode) {
         lastFailure = `attempt error: ${err?.message || err}`;
         log(`attempt ${attempt}: ${lastFailure}`);
         try { up && up.destroy(); } catch {}
-        if (clientGone) return;
+        if (clientGone) { stopEarlyHeaderTimer(); stopKeepalive(); return; }
         hardFailures++;
         if (hardFailures > MAX_RETRIES) break;
         await sleep(backoffMs(retryCount));
@@ -887,29 +964,46 @@ async function startServer(upstreamBase, port, mode) {
     // 8006 "request body exceeds the maximum supported size"): emit it as a
     // schema-VALID error event so the turn fails with the REAL message —
     // never as "Invalid logfare/openai-compatible-chat stream event".
+    const emitSseError = (obj) => {
+      ensureStreamHeaders({}, attemptsUsed - 1);
+      try { res.write(`data: ${JSON.stringify(obj)}\n\n`); } catch {}
+      try { res.write("data: [DONE]\n\n"); } catch {}
+      endStream();
+    };
     if (lastStatus === 200 && lastStatusBody) {
       const trimmed = lastStatusBody.trim();
       if (isErrorPayload(trimmed)) {
         const probe = analyzeEvent(trimmed);
         const text = probe.kind === "repair" ? probe.text : trimmed;
-        try { res.writeHead(200, { "content-type": "text/event-stream", "x-lf-retries": String(Math.max(0, attemptsUsed - 1)) }); } catch {}
-        try { res.write(`data: ${text}\n\n`); res.write("data: [DONE]\n\n"); res.end(); } catch {}
+        ensureStreamHeaders({}, attemptsUsed - 1);
+        try { res.write(`data: ${text}\n\n`); } catch {}
+        try { res.write("data: [DONE]\n\n"); } catch {}
+        endStream();
         return;
       }
     }
     if (lastStatus && lastStatus >= 400 && lastStatusBody !== null) {
+      // Deterministic upstream status: if headers already sent (early stream)
+      // we must report as an in-stream error; otherwise pass status through.
+      if (res.headersSent) {
+        let msg = `upstream status ${lastStatus}`;
+        try { const j = JSON.parse(lastStatusBody); if (j?.error?.message) msg = j.error.message; else if (typeof j?.error === "string") msg = j.error; } catch {}
+        emitSseError({ error: { message: msg, type: "upstream_error", code: String(lastStatus) } });
+        return;
+      }
       try { res.writeHead(lastStatus, { "content-type": "application/json" }); } catch {}
       try { res.end(lastStatusBody); } catch {}
       return;
     }
-    try {
-      res.writeHead(200, { "content-type": "text/event-stream", "x-lf-retries": String(MAX_RETRIES) });
-      res.write(`data: ${JSON.stringify({ error: { message: `logfare-proxy: giving up after ${MAX_RETRIES} retries — last failure: ${lastFailure}`, type: "proxy_error", code: "proxy_retries_exhausted" } })}\n\n`);
-      res.write("data: [DONE]\n\n");
-      res.end();
-    } catch {
-      try { if (!res.headersSent) res.writeHead(502, { "content-type": "text/plain" }); res.end(`logfare-proxy: ${lastFailure}`); } catch {}
+    // Generic give-up: prefer in-stream error if stream headers already sent.
+    if (wantsStream || res.headersSent) {
+      emitSseError({ error: { message: `logfare-proxy: giving up after ${MAX_RETRIES} retries — last failure: ${lastFailure}`, type: "proxy_error", code: "proxy_retries_exhausted" } });
+      return;
     }
+    try {
+      res.writeHead(502, { "content-type": "text/plain" });
+      res.end(`logfare-proxy: ${lastFailure}`);
+    } catch {}
   }
 
   const server = createServer();
