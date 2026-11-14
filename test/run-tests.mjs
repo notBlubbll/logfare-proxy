@@ -1,4 +1,4 @@
-// Test harness for logfare-proxy. Spawns:
+﻿// Test harness for logfare-proxy. Spawns:
 //   - a mock upstream on 127.0.0.1:17999 (scenarios keyed by request "model")
 //   - the proxy (bun index.js) on 127.0.0.1:17331 with LOGFARE_PROXY_UPSTREAM
 // Then drives HTTP requests through the proxy and asserts behavior.
@@ -151,6 +151,25 @@ const scenarios = {
       sse(res, ['{"choices":[{"delta":{"content":"rl-ok"}}]}', "[DONE]"]);
     }
   },
+  // P: "Service temporarily unavailable" is transient -> patient retry, does
+  // NOT consume the 10 hard retries (12 retries then success would give up
+  // under the old hard-failure accounting).
+  "t-transient-patient": (req, res) => {
+    const n = hitCount;
+    if (n <= 12) {
+      sse(res, ['{"error":{"message":"Service temporarily unavailable","type":"server_error"}}']);
+    } else {
+      sse(res, ['{"choices":[{"delta":{"content":"transient-ok"}}]}', "[DONE]"]);
+    }
+  },
+  // Q: upstream closes right after finish_reason without [DONE] -> the turn is
+  // complete; proxy must synthesize [DONE] and must NOT emit an error chunk.
+  "t-finish-no-done": (req, res) => {
+    sse(res, [
+      '{"choices":[{"delta":{"content":"done-no-done"}}]}',
+      '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+    ]);
+  },
 };
 
 const mock = createServer((req, res) => {
@@ -266,6 +285,15 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     hitCount = 0;
     r = await readSSE("/v1/chat/completions", { model: "t-inband-rl", stream: true });
     check("M: in-band Serverless RL retried patiently", r.retries === "1" && textOf(r.text) === "rl-ok", `retries=${r.retries} text=${textOf(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-transient-patient", stream: true });
+    check("P: 'Service temporarily unavailable' patient (13 attempts, no give-up)", r.retries === "12" && textOf(r.text) === "transient-ok", `retries=${r.retries} text=${textOf(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-finish-no-done", stream: true });
+    const qErr = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    check("Q: finish_reason without [DONE] -> clean [DONE], no error chunk", textOf(r.text) === "done-no-done" && !qErr && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     // N: text model + image -> vision model captions it, text model gets text only
     const imgBody = {

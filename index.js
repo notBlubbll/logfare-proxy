@@ -91,6 +91,12 @@ const RATE_LIMIT_RE = /(rate.?limit|per.?(minute|hour)|too many requests|quota|\
 // arrives as HTTP 200 + JSON error body, or 413): NOT deterministic — the
 // same body succeeds on a later attempt, so retry patiently like rate limits.
 const PATIENT_SIZE_RE = /(exceeds the maximum supported size|payload too large|request (body|entity) too large|"code"\s*:\s*8006|\b8006\b)/i;
+// Transient upstream availability errors ("Service temporarily unavailable",
+// 503 "temporarily unavailable", bad gateway, connection resets, overloaded):
+// the SAME request succeeds on a later attempt, so retry patiently like rate
+// limits instead of burning the 10 hard retries in ~30s and surfacing the
+// error to the client (which then retries the whole turn).
+const TRANSIENT_RE = /(service temporarily unavailable|temporarily unavailable|try again later|bad gateway|gateway time-?out|upstream (?:connect|connection|request)|connection (?:reset|refused|closed)|unexpected eof|overloaded|capacity)/i;
 
 // ---- model-based vision handoff ----
 // A text-only target model that receives image parts cannot see them. The
@@ -748,12 +754,12 @@ async function startServer(upstreamBase, port, mode) {
           const retryable = lastStatus === 429 || lastStatus === 408 || lastStatus >= 500;
           if (!retryable) { log(`attempt ${attempt}: ${lastFailure}`); break; } // deterministic 4xx: pass through now
           const patient = lastStatus === 429 || lastStatus === 413
-            || (lastStatus >= 400 && (RATE_LIMIT_RE.test(text) || PATIENT_SIZE_RE.test(text)));
+            || (lastStatus >= 400 && (RATE_LIMIT_RE.test(text) || PATIENT_SIZE_RE.test(text) || TRANSIENT_RE.test(text)));
           if (patient) {
-            // token-per-minute etc: retry until it works (budget-bound)
+            // token-per-minute / transient outage: retry until it works (budget-bound)
             const wait = parseRetryAfterMs(up.headers["retry-after"]) || rateLimitBackoffMs(rlStreak++);
-            if (Date.now() + wait >= rlDeadline) { log(`attempt ${attempt}: ${lastFailure} — rate-limit budget exhausted`); break; }
-            log(`attempt ${attempt}: ${lastFailure} — rate-limited, retrying in ${Math.round(wait / 1000)}s`);
+            if (Date.now() + wait >= rlDeadline) { log(`attempt ${attempt}: ${lastFailure} — patient budget exhausted`); break; }
+            log(`attempt ${attempt}: ${lastFailure} — transient/rate-limited, retrying in ${Math.round(wait / 1000)}s`);
             await sleep(wait);
             continue;
           }
@@ -840,6 +846,7 @@ async function startServer(upstreamBase, port, mode) {
         let bailedRLFlag = false;
         let drops = 0;
         let sawDone = false;
+        let sawFinish = false;
         let lastErr = null;
         const commitData = () => {
           if (!dataCommitted) {
@@ -854,6 +861,18 @@ async function startServer(upstreamBase, port, mode) {
         const readUp = makeReader(up);
         let firstByteSeen = false;
 
+        // An event carrying a non-null finish_reason means the completion is
+        // semantically done even if the upstream never sends [DONE]. Some
+        // logfare routes close the stream right after finish_reason; treating
+        // that as an error made the client retry whole turns.
+        const hasFinishReason = (data) => {
+          if (!data.startsWith("{")) return false;
+          try {
+            const j = JSON.parse(data);
+            return Array.isArray(j?.choices) && j.choices.some((c) => c && c.finish_reason !== undefined && c.finish_reason !== null);
+          } catch { return false; }
+        };
+
         // returns {bail, rateLimited} (pre-commit failure) or null
         const handleEvent = (raw) => {
           const data = eventData(raw);
@@ -865,8 +884,9 @@ async function startServer(upstreamBase, port, mode) {
             return null;
           }
           if (isErrorPayload(data) && !dataCommitted) {
-            return { bail: `error event pre-commit: ${snippet(data)}`, rateLimited: RATE_LIMIT_RE.test(data) || PATIENT_SIZE_RE.test(data), errorBody: data };
+            return { bail: `error event pre-commit: ${snippet(data)}`, rateLimited: RATE_LIMIT_RE.test(data) || PATIENT_SIZE_RE.test(data) || TRANSIENT_RE.test(data), errorBody: data };
           }
+          if (hasFinishReason(data)) sawFinish = true;
           if (verdict.kind === "repair") {
             commitData();
             dbg(`fwd repair: ${snippet(verdict.text, 80)}`);
@@ -913,18 +933,24 @@ async function startServer(upstreamBase, port, mode) {
           // post-commit: cannot retry without duplicating client-visible
           // content — heal the tail instead (tinyproxy pattern).
           if (!sawDone) {
-            const msg = lastErr === "client-gone" ? null
-              : lastErr ? `Upstream stream error: ${lastErr?.message || lastErr}`
-              : "Upstream closed the stream without [DONE]";
-            if (msg) {
+            if (lastErr === "client-gone") {
+              // client already disconnected; nothing to heal
+            } else if (sawFinish) {
+              // Upstream closed after a finish_reason: the completion is
+              // complete. Terminate cleanly (no error chunk -> no client retry).
+              try { res.write("data: [DONE]\n\n"); } catch {}
+              log(`post-commit clean finish (no [DONE]): synthesized [DONE]`);
+            } else {
+              const msg = lastErr ? `Upstream stream error: ${lastErr?.message || lastErr}`
+                : "Upstream closed the stream without [DONE]";
               try { res.write(`data: ${JSON.stringify({ error: { message: msg, type: "proxy_error", code: "proxy_stream_error" } })}\n\n`); } catch {}
               log(`post-commit synth error: ${msg}`);
+              try { res.write("data: [DONE]\n\n"); } catch {}
             }
-            try { res.write("data: [DONE]\n\n"); } catch {}
           }
           endStream();
           try { up.destroy(); } catch {} // release the dedicated socket (never pooled)
-          log(`req ${pathAndQuery}: stream done retries=${retryCount} drops=${drops} sawDone=${sawDone} in ${Date.now() - started}ms`);
+          log(`req ${pathAndQuery}: stream done retries=${retryCount} drops=${drops} sawDone=${sawDone} sawFinish=${sawFinish} in ${Date.now() - started}ms`);
           return;
         }
 
@@ -1021,11 +1047,35 @@ async function startServer(upstreamBase, port, mode) {
     try { socket.end("HTTP/1.1 400 Bad Request\r\n\r\n"); } catch {}
   });
 
+  // One retry timer per server instance, cancelled on takeover/shutdown.
+  // Without this, every plugin reload left a zombie EADDRINUSE retry loop
+  // behind (one per reload, forever): thousands of "port busy" log lines and
+  // a stale-code server that could grab the port later.
+  let listenRetryTimer = null;
+  let shuttingDown = false;
+  const scheduleListenRetry = () => {
+    if (shuttingDown || listenRetryTimer) return;
+    listenRetryTimer = setTimeout(() => {
+      listenRetryTimer = null;
+      if (!shuttingDown) listen();
+    }, 5000);
+    try { listenRetryTimer.unref?.(); } catch {}
+  };
+  const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    if (listenRetryTimer) { clearTimeout(listenRetryTimer); listenRetryTimer = null; }
+    try { server.closeAllConnections?.(); } catch {}
+    try { server.close(() => {}); } catch {}
+  };
+  server.__lfShutdown = shutdown;
+
   // hot-reload safety (tinyproxy pattern): close a previous instance first
   try {
     const prev = globalThis.__logfareProxyServer;
     globalThis.__logfareProxyServer = null;
     if (prev) {
+      try { prev.__lfShutdown?.(); } catch {}
       try { prev.closeAllConnections?.(); } catch {}
       await new Promise((resolve) => { try { prev.close(resolve); } catch { resolve(); } });
     }
@@ -1033,15 +1083,17 @@ async function startServer(upstreamBase, port, mode) {
   globalThis.__logfareProxyServer = server;
 
   const listen = () => {
+    if (shuttingDown) return;
     server.listen(port, LISTEN_HOST, () => {
+      if (listenRetryTimer) { clearTimeout(listenRetryTimer); listenRetryTimer = null; }
       log(`listening (${mode}) on http://${LISTEN_HOST}:${port} -> ${upstreamBase}`);
     });
   };
   server.on("error", (err) => {
+    if (shuttingDown) return;
     if (err && err.code === "EADDRINUSE") {
       log(`port ${port} busy — retrying every 5s (another logfare-proxy instance may be serving; takeover on release)`);
-      const t = setTimeout(listen, 5000);
-      try { t.unref?.(); } catch {}
+      scheduleListenRetry();
     } else {
       log(`server error: ${err?.stack || err}`);
     }
