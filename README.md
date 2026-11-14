@@ -166,12 +166,23 @@ Per-request overrides (stripped before forwarding): `x-lf-upstream`,
 bun test/run-tests.mjs
 ```
 
-Spins a mock upstream plus the proxy and asserts 19 scenarios: pre-commit
+Spins a mock upstream plus the proxy and asserts 24 scenarios: pre-commit
 retry, post-commit drop, in-band error retry, give-up after exactly 10 retries,
 null-field repair, mid-stream healing, non-stream passthrough, bulk-JSON
 conversion, stall retry, 200+8006 same-body retry, budget exhaustion surfacing
 the real error, patient TPM retry, vision handoff (image → caption → text
-model), and caption caching (no second vision call).
+model), and caption caching (no second vision call). Newer cases also cover
+transient `Service temporarily unavailable` retries (no budget), post-commit
+suppression of that error, `finish_reason` injection before `[DONE]`/close, and
+clean closes without `[DONE]`.
+
+## Desktop working timer (optional)
+
+`desktop-working-timer/` is a small OpenCode Desktop GUI plugin (experimental
+`gui-experimental.cjs` API) that shows `Working (20s)` as a composer pill while
+the routed session is running. It needs no ASAR patching or app rebuild. Copy it
+to `~/.config/opencode/plugins/working-timer/`, then run `opencode reload` and
+restart the desktop window. See `desktop-working-timer/README.md`.
 
 ## Operational notes
 
