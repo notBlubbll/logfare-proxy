@@ -1020,7 +1020,7 @@ async function startServer(upstreamBase, port, mode) {
           const finishReason = finishReasonOf(data);
           if (finishReason !== null) {
             sawFinish = true;
-            log(`finish_reason=${finishReason} chars=${forwardedChars}`);
+            log(`finish_reason=${finishReason} chars=${sentContent.length}`);
           }
           if (verdict.kind === "repair") {
             commitData();
@@ -1177,7 +1177,7 @@ async function startServer(upstreamBase, port, mode) {
           }
           endStream();
           try { up.destroy(); } catch {} // release the dedicated socket (never pooled)
-          log(`req ${pathAndQuery}: stream done retries=${retryCount} drops=${drops} chars=${forwardedChars} sawDone=${sawDone} sawFinish=${sawFinish} in ${Date.now() - started}ms`);
+          log(`req ${pathAndQuery}: stream done retries=${retryCount} drops=${drops} chars=${sentContent.length} sawDone=${sawDone} sawFinish=${sawFinish} in ${Date.now() - started}ms`);
           return;
         }
 
