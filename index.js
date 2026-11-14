@@ -68,6 +68,11 @@
 //      {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]} before
 //      [DONE]/close whenever no finish_reason was seen, so the client always
 //      sees a complete turn.
+// rev: 2.4 — post-commit continuation: when logfare cuts a stream mid-answer
+//      (no finish_reason/[DONE]) or sends a transient error after content, the
+//      proxy retries the SAME request and skips the prefix already sent,
+//      streaming only the new suffix. If the retry diverges, it closes the
+//      partial answer cleanly instead of showing an error/retry loop.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -740,7 +745,7 @@ async function startServer(upstreamBase, port, mode) {
       }
     }
 
-    log(`req ${req.method} ${pathAndQuery} model=${model} stream=${wantsStream} bytes=${reqSize}`);
+    log(`req ${req.method} ${pathAndQuery} model=${model} stream=${wantsStream} bytes=${reqSize} max_tokens=${reqJson?.max_tokens ?? reqJson?.max_completion_tokens ?? "default"}`);
     if (clientGone) { stopEarlyHeaderTimer(); stopKeepalive(); log(`req ${pathAndQuery}: client gone, stop`); return; }
 
     let lastStatus = null;
@@ -751,6 +756,16 @@ async function startServer(upstreamBase, port, mode) {
     let hardFailures = 0;
     let rlStreak = 0;
     let attemptsUsed = 0;
+    // Post-commit continuation: when the upstream cuts a stream mid-answer
+    // (no finish_reason/[DONE]) or sends a transient error after content, we
+    // retry the SAME request and skip the prefix already sent to the client,
+    // then stream only the new suffix. This preserves streaming without
+    // duplicating or retracting content. If the retry diverges, we end with
+    // the partial answer instead of showing an error/retry loop.
+    let sentContent = "";
+    let continuationPrefix = null;
+    let continuationAttempts = 0;
+    const MAX_CONTINUATION = 3;
     for (let attempt = 1; ; attempt++) {
       attemptsUsed = attempt;
       if (clientGone) { stopKeepalive(); log(`req ${pathAndQuery}: client gone, stop`); return; }
@@ -864,9 +879,13 @@ async function startServer(upstreamBase, port, mode) {
         let bailed = false;
         let bailedRLFlag = false;
         let bailedNeverForward = false;
+        let bailedPostCommit = false;
+        let continuationFailed = false;
         let drops = 0;
         let sawDone = false;
         let sawFinish = false;
+        let sawToolCalls = false;
+        let forwardedChars = 0;
         let lastErr = null;
         const commitData = () => {
           if (!dataCommitted) {
@@ -880,23 +899,89 @@ async function startServer(upstreamBase, port, mode) {
         const decoder = new TextDecoder();
         const readUp = makeReader(up);
         let firstByteSeen = false;
+        let continuationMatched = continuationPrefix === null;
+        let continuationBuffer = "";
+        let continuationEmitted = 0;
 
         // An event carrying a non-null finish_reason means the completion is
         // semantically done even if the upstream never sends [DONE]. Some
         // logfare routes close the stream right after finish_reason; treating
         // that as an error made the client retry whole turns.
-        const hasFinishReason = (data) => {
-          if (!data.startsWith("{")) return false;
+        const finishReasonOf = (data) => {
+          if (!data.startsWith("{")) return null;
           try {
             const j = JSON.parse(data);
-            return Array.isArray(j?.choices) && j.choices.some((c) => c && c.finish_reason !== undefined && c.finish_reason !== null);
-          } catch { return false; }
+            if (!Array.isArray(j?.choices)) return null;
+            const c = j.choices.find((x) => x && x.finish_reason !== undefined && x.finish_reason !== null);
+            return c ? c.finish_reason : null;
+          } catch { return null; }
+        };
+        const hasFinishReason = (data) => finishReasonOf(data) !== null;
+        const contentDelta = (data) => {
+          if (!data.startsWith("{")) return "";
+          try {
+            const j = JSON.parse(data);
+            const c = j?.choices?.[0]?.delta?.content;
+            return typeof c === "string" ? c : "";
+          } catch { return ""; }
+        };
+        const stripContent = (data) => {
+          if (!data.startsWith("{")) return data;
+          try {
+            const j = JSON.parse(data);
+            if (!Array.isArray(j?.choices)) return data;
+            let changed = false;
+            for (const c of j.choices) {
+              if (c?.delta && typeof c.delta.content === "string") {
+                delete c.delta.content;
+                changed = true;
+              }
+            }
+            return changed ? JSON.stringify(j) : data;
+          } catch { return data; }
         };
 
         // returns {bail, rateLimited} (pre-commit failure) or null
         const handleEvent = (raw) => {
           const data = eventData(raw);
           const verdict = analyzeEvent(data);
+          // Continuation mode: buffer the retry's content until it grows past
+          // the prefix already sent, verify it starts with that prefix, then
+          // emit only the new suffix. Other events before the match are
+          // dropped (the client already has them).
+          if (!continuationMatched) {
+            if (data.includes('"tool_calls"')) {
+              continuationFailed = true;
+              return { bail: `continuation saw tool_calls`, continuationFailed: true };
+            }
+            const c = contentDelta(data);
+            if (c) continuationBuffer += c;
+            if (continuationBuffer.length >= continuationPrefix.length) {
+              if (!continuationBuffer.startsWith(continuationPrefix)) {
+                continuationFailed = true;
+                return { bail: `continuation diverged after ${continuationBuffer.length} chars`, continuationFailed: true };
+              }
+              continuationMatched = true;
+              const suffix = continuationBuffer.slice(continuationPrefix.length);
+              continuationEmitted = suffix.length;
+              if (suffix) {
+                try { res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: suffix } }] })}\n\n`); } catch {}
+                sentContent += suffix;
+                forwardedChars += suffix.length;
+              }
+              const rest = stripContent(data);
+              if (rest) {
+                try { res.write(`data: ${rest}\n\n`); } catch {}
+              }
+              log(`continuation matched at ${continuationPrefix.length} chars; emitted ${suffix.length} new chars`);
+              return null;
+            }
+            if (finishReasonOf(data) !== null || data === "[DONE]" || isErrorPayload(data)) {
+              continuationFailed = true;
+              return { bail: `continuation ended before prefix match`, continuationFailed: true };
+            }
+            return null;
+          }
           if (verdict.kind === "invalid") {
             if (!dataCommitted) return { bail: `invalid event pre-commit: ${verdict.reason}: ${snippet(data)}`, rateLimited: false };
             drops++;
@@ -916,6 +1001,13 @@ async function startServer(upstreamBase, port, mode) {
           // desktop retry the whole turn ("Attempt N - retrying"). Close the
           // stream cleanly instead.
           if (isErrorPayload(data) && dataCommitted && NEVER_FORWARD_RE.test(data)) {
+            if (!sawFinish && !sawToolCalls && sentContent.length > 0 && continuationAttempts < MAX_CONTINUATION
+                && (continuationPrefix === null || continuationEmitted > 0)) {
+              continuationPrefix = sentContent;
+              continuationAttempts++;
+              log(`POST-commit never-forward error; continuation ${continuationAttempts}/${MAX_CONTINUATION} after ${sentContent.length} chars`);
+              return { bail: `post-commit continuation`, rateLimited: false, neverForward: true, postCommit: true };
+            }
             log(`POST-commit SUPPRESS never-forward error: ${snippet(data)}`);
             if (!sawFinish) {
               try { res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`); } catch {}
@@ -925,11 +1017,18 @@ async function startServer(upstreamBase, port, mode) {
             sawDone = true;
             return null;
           }
-          if (hasFinishReason(data)) sawFinish = true;
+          const finishReason = finishReasonOf(data);
+          if (finishReason !== null) {
+            sawFinish = true;
+            log(`finish_reason=${finishReason} chars=${forwardedChars}`);
+          }
           if (verdict.kind === "repair") {
             commitData();
             dbg(`fwd repair: ${snippet(verdict.text, 80)}`);
             res.write(`data: ${verdict.text}\n\n`);
+            forwardedChars += contentDelta(verdict.text).length;
+            sentContent += contentDelta(verdict.text);
+            if (verdict.text.includes('"tool_calls"')) sawToolCalls = true;
             return null;
           }
           // logfare sometimes ends with [DONE] but never sends a chunk with a
@@ -951,6 +1050,9 @@ async function startServer(upstreamBase, port, mode) {
           commitData();
           dbg(`fwd raw: ${snippet(data, 80)}`);
           res.write(raw + "\n\n");
+          forwardedChars += contentDelta(data).length;
+          sentContent += contentDelta(data);
+          if (data.includes('"tool_calls"')) sawToolCalls = true;
           return null;
         };
 
@@ -966,27 +1068,91 @@ async function startServer(upstreamBase, port, mode) {
             let bail = null;
             let bailRL = false;
             let bailNeverForward = false;
+            let bailPostCommit = false;
+            let bailContinuationFailed = false;
             for (const raw of events) {
               const r = handleEvent(raw);
-              if (r) { bail = r.bail; bailRL = r.rateLimited; bailNeverForward = !!r.neverForward; if (r.errorBody) lastStatusBody = r.errorBody; break; }
+              if (r) {
+                bail = r.bail;
+                bailRL = r.rateLimited;
+                bailNeverForward = !!r.neverForward;
+                bailPostCommit = !!r.postCommit;
+                bailContinuationFailed = !!r.continuationFailed;
+                if (r.errorBody) lastStatusBody = r.errorBody;
+                break;
+              }
               if (sawDone) break;
             }
-            if (bail) { lastFailure = bail; log(`attempt ${attempt}: ${bail}`); bailed = true; bailedRLFlag = bailRL; bailedNeverForward = bailNeverForward; break; }
+            if (bail) {
+              lastFailure = bail;
+              log(`attempt ${attempt}: ${bail}`);
+              bailed = true;
+              bailedRLFlag = bailRL;
+              bailedNeverForward = bailNeverForward;
+              bailedPostCommit = bailPostCommit;
+              continuationFailed = bailContinuationFailed;
+              break;
+            }
             if (sawDone) break;
           }
           if (!bailed && !sawDone) {
             for (const raw of ev.flush()) {
               const r = handleEvent(raw);
-              if (r) { lastFailure = r.bail; if (r.errorBody) lastStatusBody = r.errorBody; log(`attempt ${attempt}: ${r.bail}`); bailed = true; bailedRLFlag = r.rateLimited; bailedNeverForward = !!r.neverForward; break; }
+              if (r) {
+                lastFailure = r.bail;
+                if (r.errorBody) lastStatusBody = r.errorBody;
+                log(`attempt ${attempt}: ${r.bail}`);
+                bailed = true;
+                bailedRLFlag = r.rateLimited;
+                bailedNeverForward = !!r.neverForward;
+                bailedPostCommit = !!r.postCommit;
+                continuationFailed = !!r.continuationFailed;
+                break;
+              }
             }
           }
         } catch (streamErr) {
           lastErr = streamErr;
           log(`attempt ${attempt}: stream error: ${streamErr?.message || streamErr}`);
         }
+        if (continuationFailed) {
+          // The retry diverged or ended before reaching the prefix. We cannot
+          // safely splice it, so close the partial answer cleanly.
+          log(`continuation failed after ${sentContent.length} chars; ending partial stream`);
+          ensureStreamHeaders({}, retryCount);
+          try { res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`); } catch {}
+          try { res.write("data: [DONE]\n\n"); } catch {}
+          endStream();
+          try { up.destroy(); } catch {}
+          return;
+        }
+        if (bailedPostCommit) {
+          try { up.destroy(); } catch {}
+          if (continuationAttempts >= MAX_CONTINUATION) {
+            log(`continuation attempts exhausted; ending partial stream`);
+            ensureStreamHeaders({}, retryCount);
+            try { res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`); } catch {}
+            try { res.write("data: [DONE]\n\n"); } catch {}
+            endStream();
+            return;
+          }
+          log(`continuation retry ${continuationAttempts}/${MAX_CONTINUATION} after ${sentContent.length} chars`);
+          await sleep(backoffMs(retryCount));
+          continue;
+        }
         if (dataCommitted) {
-          // post-commit: cannot retry without duplicating client-visible
-          // content — heal the tail instead (tinyproxy pattern).
+          // Post-commit truncation: retry and continue after the already-sent
+          // prefix when possible (no finish_reason/[DONE], no tool calls).
+          if (!sawDone && !sawFinish && !sawToolCalls && sentContent.length > 0
+              && continuationAttempts < MAX_CONTINUATION && !lastErr
+              && (continuationPrefix === null || continuationEmitted > 0)) {
+            continuationPrefix = sentContent;
+            continuationAttempts++;
+            log(`post-commit truncation; continuation ${continuationAttempts}/${MAX_CONTINUATION} after ${sentContent.length} chars`);
+            try { up.destroy(); } catch {}
+            await sleep(backoffMs(retryCount));
+            continue;
+          }
           if (!sawDone) {
             if (lastErr === "client-gone") {
               // client already disconnected; nothing to heal
@@ -1011,7 +1177,7 @@ async function startServer(upstreamBase, port, mode) {
           }
           endStream();
           try { up.destroy(); } catch {} // release the dedicated socket (never pooled)
-          log(`req ${pathAndQuery}: stream done retries=${retryCount} drops=${drops} sawDone=${sawDone} sawFinish=${sawFinish} in ${Date.now() - started}ms`);
+          log(`req ${pathAndQuery}: stream done retries=${retryCount} drops=${drops} chars=${forwardedChars} sawDone=${sawDone} sawFinish=${sawFinish} in ${Date.now() - started}ms`);
           return;
         }
 
@@ -1048,6 +1214,18 @@ async function startServer(upstreamBase, port, mode) {
 
     // give-up path (only after MAX_RETRIES): surface the last failure
     log(`req ${pathAndQuery}: GIVING UP (attempts=${attemptsUsed}, hardFailures=${hardFailures}): ${lastFailure}`);
+    // If content was already streamed, never surface a late error (it would
+    // make the desktop retry the whole turn). Close the partial answer cleanly.
+    if (dataCommitted && sentContent.length > 0) {
+      log(`req ${pathAndQuery}: give-up after partial content (${sentContent.length} chars); ending partial stream`);
+      ensureStreamHeaders({}, attemptsUsed - 1);
+      try {
+        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+        res.write("data: [DONE]\n\n");
+      } catch {}
+      endStream();
+      return;
+    }
     // Safety net: never forward a NEVER_FORWARD error (e.g. "Service
     // temporarily unavailable"). Close cleanly so the desktop does not start
     // its "Attempt N - retrying" turn loop.
@@ -1055,7 +1233,10 @@ async function startServer(upstreamBase, port, mode) {
       log(`req ${pathAndQuery}: give-up suppressed (never-forward): ${snippet(lastFailure)}`);
       if (wantsStream || res.headersSent) {
         ensureStreamHeaders({}, attemptsUsed - 1);
-        try { res.write("data: [DONE]\n\n"); } catch {}
+        try {
+          res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+          res.write("data: [DONE]\n\n");
+        } catch {}
         endStream();
       } else {
         try {

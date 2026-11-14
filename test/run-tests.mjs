@@ -194,6 +194,56 @@ const scenarios = {
       '{"choices":[{"delta":{"content":"closed-no-finish"}}]}',
     ]);
   },
+  // U: mid-answer transient error -> proxy retries, skips the sent prefix,
+  // and streams only the continuation (no duplicate, no error).
+  "t-postcommit-continue": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      sse(res, [
+        '{"choices":[{"delta":{"content":"Hello "}}]}',
+        '{"error":{"message":"Service temporarily unavailable","type":"server_error"}}',
+      ]);
+    } else {
+      sse(res, [
+        '{"choices":[{"delta":{"content":"Hello world!"}}]}',
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    }
+  },
+  // V: the retry diverges from the sent prefix -> end the partial answer
+  // cleanly instead of duplicating/garbling it.
+  "t-postcommit-diverge": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      sse(res, [
+        '{"choices":[{"delta":{"content":"Hello "}}]}',
+        '{"error":{"message":"Service temporarily unavailable","type":"server_error"}}',
+      ]);
+    } else {
+      sse(res, [
+        '{"choices":[{"delta":{"content":"Goodbye"}}]}',
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    }
+  },
+  // W: upstream cuts the stream with no error/finish/[DONE] -> proxy retries
+  // and streams the continuation after the sent prefix.
+  "t-truncate-continue": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      sse(res, [
+        '{"choices":[{"delta":{"content":"Part one "}}]}',
+      ]);
+    } else {
+      sse(res, [
+        '{"choices":[{"delta":{"content":"Part one two!"}}]}',
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    }
+  },
 };
 
 const mock = createServer((req, res) => {
@@ -336,6 +386,21 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     const tFinish = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.choices?.[0]?.finish_reason; } catch { return false; } });
     const tErr = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
     check("T: clean close without finish_reason/[DONE] -> injected finish + DONE", textOf(r.text) === "closed-no-finish" && tFinish && !tErr && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-postcommit-continue", stream: true });
+    const uErr = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    check("U: post-commit error continued without duplication", textOf(r.text) === "Hello world!" && !uErr && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-postcommit-diverge", stream: true });
+    const vErr = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    check("V: divergent continuation ends partial cleanly", textOf(r.text) === "Hello " && !vErr && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-truncate-continue", stream: true });
+    const wErr = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    check("W: truncated stream continued after sent prefix", textOf(r.text) === "Part one two!" && !wErr && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     // N: text model + image -> vision model captions it, text model gets text only
     const imgBody = {
