@@ -179,6 +179,21 @@ const scenarios = {
       '{"error":{"message":"Service temporarily unavailable","type":"server_error"}}',
     ]);
   },
+  // S: upstream sends [DONE] but never a finish_reason chunk. OpenCode rejects
+  // that with "OpenAI Chat stream ended without finish_reason"; the proxy must
+  // inject a terminal finish_reason chunk before [DONE].
+  "t-done-no-finish": (req, res) => {
+    sse(res, [
+      '{"choices":[{"delta":{"content":"done-no-finish"}}]}',
+      "[DONE]",
+    ]);
+  },
+  // T: upstream closes cleanly without finish_reason or [DONE].
+  "t-close-no-finish": (req, res) => {
+    sse(res, [
+      '{"choices":[{"delta":{"content":"closed-no-finish"}}]}',
+    ]);
+  },
 };
 
 const mock = createServer((req, res) => {
@@ -307,7 +322,20 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     hitCount = 0;
     r = await readSSE("/v1/chat/completions", { model: "t-never-forward-postcommit", stream: true });
     const rErr = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
-    check("R: post-commit 'Service temporarily unavailable' suppressed", textOf(r.text) === "partial" && !rErr && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+    const rFinish = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.choices?.[0]?.finish_reason; } catch { return false; } });
+    check("R: post-commit 'Service temporarily unavailable' suppressed", textOf(r.text) === "partial" && !rErr && rFinish && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-done-no-finish", stream: true });
+    const sFinish = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.choices?.[0]?.finish_reason; } catch { return false; } });
+    const sErr = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    check("S: [DONE] without finish_reason -> injected finish_reason", textOf(r.text) === "done-no-finish" && sFinish && !sErr && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-close-no-finish", stream: true });
+    const tFinish = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.choices?.[0]?.finish_reason; } catch { return false; } });
+    const tErr = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    check("T: clean close without finish_reason/[DONE] -> injected finish + DONE", textOf(r.text) === "closed-no-finish" && tFinish && !tErr && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     // N: text model + image -> vision model captions it, text model gets text only
     const imgBody = {

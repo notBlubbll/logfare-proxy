@@ -61,6 +61,13 @@
 //      keepalive comments flow meanwhile. This prevents "Timed out waiting for
 //      response headers" without weakening stream validation (invalid events are
 //      still never forwarded).
+// rev: 2.3 — finish_reason guarantee: logfare sometimes ends a stream with
+//      [DONE] (or a clean socket close) without ever sending a chunk carrying
+//      finish_reason. OpenCode's openai-compatible router rejects that with
+//      "OpenAI Chat stream ended without finish_reason". The proxy now injects
+//      {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]} before
+//      [DONE]/close whenever no finish_reason was seen, so the client always
+//      sees a complete turn.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -910,6 +917,10 @@ async function startServer(upstreamBase, port, mode) {
           // stream cleanly instead.
           if (isErrorPayload(data) && dataCommitted && NEVER_FORWARD_RE.test(data)) {
             log(`POST-commit SUPPRESS never-forward error: ${snippet(data)}`);
+            if (!sawFinish) {
+              try { res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`); } catch {}
+              sawFinish = true;
+            }
             try { res.write("data: [DONE]\n\n"); } catch {}
             sawDone = true;
             return null;
@@ -921,10 +932,25 @@ async function startServer(upstreamBase, port, mode) {
             res.write(`data: ${verdict.text}\n\n`);
             return null;
           }
+          // logfare sometimes ends with [DONE] but never sends a chunk with a
+          // finish_reason. OpenCode's openai-compatible router rejects that
+          // with "OpenAI Chat stream ended without finish_reason", so inject
+          // a schema-valid terminal chunk before forwarding [DONE].
+          if (data === "[DONE]") {
+            commitData();
+            if (!sawFinish) {
+              try { res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`); } catch {}
+              sawFinish = true;
+              log(`synthesized finish_reason before [DONE]`);
+            }
+            dbg(`fwd raw: [DONE]`);
+            res.write(raw + "\n\n");
+            sawDone = true;
+            return null;
+          }
           commitData();
           dbg(`fwd raw: ${snippet(data, 80)}`);
           res.write(raw + "\n\n");
-          if (data === "[DONE]") sawDone = true;
           return null;
         };
 
@@ -969,9 +995,15 @@ async function startServer(upstreamBase, port, mode) {
               // complete. Terminate cleanly (no error chunk -> no client retry).
               try { res.write("data: [DONE]\n\n"); } catch {}
               log(`post-commit clean finish (no [DONE]): synthesized [DONE]`);
+            } else if (!lastErr) {
+              // Clean close without finish_reason or [DONE]: synthesize both so
+              // OpenCode's requireFinishReason check passes.
+              try { res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`); } catch {}
+              try { res.write("data: [DONE]\n\n"); } catch {}
+              sawFinish = true;
+              log(`post-commit clean close (no finish_reason/[DONE]): synthesized finish_reason + [DONE]`);
             } else {
-              const msg = lastErr ? `Upstream stream error: ${lastErr?.message || lastErr}`
-                : "Upstream closed the stream without [DONE]";
+              const msg = `Upstream stream error: ${lastErr?.message || lastErr}`;
               try { res.write(`data: ${JSON.stringify({ error: { message: msg, type: "proxy_error", code: "proxy_stream_error" } })}\n\n`); } catch {}
               log(`post-commit synth error: ${msg}`);
               try { res.write("data: [DONE]\n\n"); } catch {}
