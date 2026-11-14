@@ -97,6 +97,15 @@ const PATIENT_SIZE_RE = /(exceeds the maximum supported size|payload too large|r
 // limits instead of burning the 10 hard retries in ~30s and surfacing the
 // error to the client (which then retries the whole turn).
 const TRANSIENT_RE = /(service temporarily unavailable|temporarily unavailable|try again later|bad gateway|gateway time-?out|upstream (?:connect|connection|request)|connection (?:reset|refused|closed)|unexpected eof|overloaded|capacity)/i;
+// Errors that must NEVER reach the client: the desktop treats them as a
+// retryable turn failure and loops ("Attempt N - retrying"). Pre-commit they
+// are retried with no budget (until success or client disconnect); post-commit
+// they are suppressed and the stream is closed cleanly with [DONE]. Configurable
+// via LOGFARE_PROXY_NEVER_FORWARD (a JS regex source, case-insensitive).
+const NEVER_FORWARD_RE = (() => {
+  const src = process.env.LOGFARE_PROXY_NEVER_FORWARD || "service temporarily unavailable";
+  try { return new RegExp(src, "i"); } catch { return /service temporarily unavailable/i; }
+})();
 
 // ---- model-based vision handoff ----
 // A text-only target model that receives image parts cannot see them. The
@@ -756,10 +765,13 @@ async function startServer(upstreamBase, port, mode) {
           const patient = lastStatus === 429 || lastStatus === 413
             || (lastStatus >= 400 && (RATE_LIMIT_RE.test(text) || PATIENT_SIZE_RE.test(text) || TRANSIENT_RE.test(text)));
           if (patient) {
-            // token-per-minute / transient outage: retry until it works (budget-bound)
+            // token-per-minute / transient outage: retry until it works.
+            // NEVER_FORWARD classes have no budget: they are retried until
+            // success or client disconnect so the client never sees them.
+            const neverForward = NEVER_FORWARD_RE.test(text);
             const wait = parseRetryAfterMs(up.headers["retry-after"]) || rateLimitBackoffMs(rlStreak++);
-            if (Date.now() + wait >= rlDeadline) { log(`attempt ${attempt}: ${lastFailure} — patient budget exhausted`); break; }
-            log(`attempt ${attempt}: ${lastFailure} — transient/rate-limited, retrying in ${Math.round(wait / 1000)}s`);
+            if (!neverForward && Date.now() + wait >= rlDeadline) { log(`attempt ${attempt}: ${lastFailure} — patient budget exhausted`); break; }
+            log(`attempt ${attempt}: ${lastFailure} — ${neverForward ? "never-forward transient" : "transient/rate-limited"}, retrying in ${Math.round(wait / 1000)}s`);
             await sleep(wait);
             continue;
           }
@@ -844,6 +856,7 @@ async function startServer(upstreamBase, port, mode) {
         headers["content-type"] = "text/event-stream";
         let bailed = false;
         let bailedRLFlag = false;
+        let bailedNeverForward = false;
         let drops = 0;
         let sawDone = false;
         let sawFinish = false;
@@ -884,7 +897,22 @@ async function startServer(upstreamBase, port, mode) {
             return null;
           }
           if (isErrorPayload(data) && !dataCommitted) {
-            return { bail: `error event pre-commit: ${snippet(data)}`, rateLimited: RATE_LIMIT_RE.test(data) || PATIENT_SIZE_RE.test(data) || TRANSIENT_RE.test(data), errorBody: data };
+            return {
+              bail: `error event pre-commit: ${snippet(data)}`,
+              rateLimited: RATE_LIMIT_RE.test(data) || PATIENT_SIZE_RE.test(data) || TRANSIENT_RE.test(data),
+              neverForward: NEVER_FORWARD_RE.test(data),
+              errorBody: data,
+            };
+          }
+          // Post-commit transient error: suppress it. The client cannot
+          // un-see partial content, and forwarding this error makes the
+          // desktop retry the whole turn ("Attempt N - retrying"). Close the
+          // stream cleanly instead.
+          if (isErrorPayload(data) && dataCommitted && NEVER_FORWARD_RE.test(data)) {
+            log(`POST-commit SUPPRESS never-forward error: ${snippet(data)}`);
+            try { res.write("data: [DONE]\n\n"); } catch {}
+            sawDone = true;
+            return null;
           }
           if (hasFinishReason(data)) sawFinish = true;
           if (verdict.kind === "repair") {
@@ -911,18 +939,19 @@ async function startServer(upstreamBase, port, mode) {
             const events = ev.feed(decoder.decode(chunk, { stream: true }));
             let bail = null;
             let bailRL = false;
+            let bailNeverForward = false;
             for (const raw of events) {
               const r = handleEvent(raw);
-              if (r) { bail = r.bail; bailRL = r.rateLimited; if (r.errorBody) lastStatusBody = r.errorBody; break; }
+              if (r) { bail = r.bail; bailRL = r.rateLimited; bailNeverForward = !!r.neverForward; if (r.errorBody) lastStatusBody = r.errorBody; break; }
               if (sawDone) break;
             }
-            if (bail) { lastFailure = bail; log(`attempt ${attempt}: ${bail}`); bailed = true; bailedRLFlag = bailRL; break; }
+            if (bail) { lastFailure = bail; log(`attempt ${attempt}: ${bail}`); bailed = true; bailedRLFlag = bailRL; bailedNeverForward = bailNeverForward; break; }
             if (sawDone) break;
           }
           if (!bailed && !sawDone) {
             for (const raw of ev.flush()) {
               const r = handleEvent(raw);
-              if (r) { lastFailure = r.bail; if (r.errorBody) lastStatusBody = r.errorBody; log(`attempt ${attempt}: ${r.bail}`); bailed = true; bailedRLFlag = r.rateLimited; break; }
+              if (r) { lastFailure = r.bail; if (r.errorBody) lastStatusBody = r.errorBody; log(`attempt ${attempt}: ${r.bail}`); bailed = true; bailedRLFlag = r.rateLimited; bailedNeverForward = !!r.neverForward; break; }
             }
           }
         } catch (streamErr) {
@@ -963,10 +992,11 @@ async function startServer(upstreamBase, port, mode) {
         }
         log(`attempt ${attempt}: pre-commit failure: ${lastFailure}`);
         if (bailed && bailedRLFlag) {
-          // rate-limited in-stream: patient retry until it works (budget-bound)
+          // rate-limited / transient in-stream: patient retry. NEVER_FORWARD
+          // classes have no budget (retry until success or client disconnect).
           const wait = rateLimitBackoffMs(rlStreak++);
-          if (Date.now() + wait >= rlDeadline) { log(`rate-limit budget exhausted`); break; }
-          log(`retrying in ${Math.round(wait / 1000)}s (rate limit)`);
+          if (!bailedNeverForward && Date.now() + wait >= rlDeadline) { log(`rate-limit budget exhausted`); break; }
+          log(`retrying in ${Math.round(wait / 1000)}s (${bailedNeverForward ? "never-forward transient" : "rate limit"})`);
           await sleep(wait);
           continue;
         }
@@ -986,6 +1016,23 @@ async function startServer(upstreamBase, port, mode) {
 
     // give-up path (only after MAX_RETRIES): surface the last failure
     log(`req ${pathAndQuery}: GIVING UP (attempts=${attemptsUsed}, hardFailures=${hardFailures}): ${lastFailure}`);
+    // Safety net: never forward a NEVER_FORWARD error (e.g. "Service
+    // temporarily unavailable"). Close cleanly so the desktop does not start
+    // its "Attempt N - retrying" turn loop.
+    if (NEVER_FORWARD_RE.test(lastFailure) || (lastStatusBody && NEVER_FORWARD_RE.test(lastStatusBody))) {
+      log(`req ${pathAndQuery}: give-up suppressed (never-forward): ${snippet(lastFailure)}`);
+      if (wantsStream || res.headersSent) {
+        ensureStreamHeaders({}, attemptsUsed - 1);
+        try { res.write("data: [DONE]\n\n"); } catch {}
+        endStream();
+      } else {
+        try {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end('{"id":"proxy","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{}}');
+        } catch {}
+      }
+      return;
+    }
     // 200 with an in-band JSON error body (e.g. logfare/Cloudflare AiError
     // 8006 "request body exceeds the maximum supported size"): emit it as a
     // schema-VALID error event so the turn fails with the REAL message —

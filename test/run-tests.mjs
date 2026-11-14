@@ -170,6 +170,15 @@ const scenarios = {
       '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
     ]);
   },
+  // R: "Service temporarily unavailable" after content committed -> proxy must
+  // suppress it (never forward) and close cleanly with [DONE], so the desktop
+  // does not start its "Attempt N - retrying" turn loop.
+  "t-never-forward-postcommit": (req, res) => {
+    sse(res, [
+      '{"choices":[{"delta":{"content":"partial"}}]}',
+      '{"error":{"message":"Service temporarily unavailable","type":"server_error"}}',
+    ]);
+  },
 };
 
 const mock = createServer((req, res) => {
@@ -294,6 +303,11 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     r = await readSSE("/v1/chat/completions", { model: "t-finish-no-done", stream: true });
     const qErr = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
     check("Q: finish_reason without [DONE] -> clean [DONE], no error chunk", textOf(r.text) === "done-no-done" && !qErr && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-never-forward-postcommit", stream: true });
+    const rErr = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    check("R: post-commit 'Service temporarily unavailable' suppressed", textOf(r.text) === "partial" && !rErr && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     // N: text model + image -> vision model captions it, text model gets text only
     const imgBody = {
