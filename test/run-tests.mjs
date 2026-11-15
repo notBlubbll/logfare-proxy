@@ -590,6 +590,18 @@ const scenarios = {
       ]);
     }
   },
+  // Z27: a complete edit block split into many tiny chunks (no single chunk
+  // matches) -> the buffer post-process must convert it, not retry forever.
+  "t-tiny-chunk-edit": (req, res) => {
+    const block = 'Let me fix the header.\n\nedit C:\\Users\\User\\Desktop\\EXPERIMENTS\\DISCORD\\CHATBOT\\src\\modules\\status-card\\index.ts</ | DSML | parameter > < | DSML | parameter name="oldString" string="true">// The header carries the session age as a plain duration, because a Discord timestamp does not render inside an embed author name. const status = liveness.online ? liveness.readyAt ? localize(locale, "status_card.bot_online_since", { duration: formatDuration(locale, Date.now() - liveness.readyAt) }) : localize(locale, "status_card.bot_online") : localize(locale, "status_card.bot_offline");</ | DSML | parameter > < | DSML | parameter name="newString" string="true">// The header names the state only. The session age is the Awake field below. const status = liveness.online ? localize(locale, "status_card.bot_online") : localize(locale, "status_card.bot_offline");</ | DSML | parameter>';
+    const events = [];
+    for (let i = 0; i < block.length; i += 15) {
+      events.push(`{"choices":[{"delta":{"content":${JSON.stringify(block.slice(i, i + 15))}}}]}`);
+    }
+    events.push('{"choices":[{"delta":{},"finish_reason":"stop"}]}');
+    events.push("[DONE]");
+    sse(res, events);
+  },
   // Z24: unparseable DSML shape -> retry instead of showing raw DSML.
   "t-dsml-garbage-retry": (req, res) => {
     const n = hitCount;
@@ -606,6 +618,35 @@ const scenarios = {
         "[DONE]",
       ]);
     }
+  },
+  // Z25: bare path + raw code dump (~900 chars, no edit/write keyword) ->
+  // buffer mode retries instead of showing the file content in chat.
+  "t-bare-path-code-dump-retry": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      const dump = 'Discord wants JSON with a data URI, not multipart. Let me fix that.\nC:\\Users\\User\\Desktop\\EXPERIMENTS\\DISCORD\\CHATBOT\\tmp\\applyavatars.ts const form = new FormData(); form.append("avatar", `data:image/png;base64,${png.toString("base64")}`);\n\nconst response = await fetch("https://discord.com/api/v10/users/@me", { method: "PATCH", headers: { Authorization: `Bot ${token}` }, body: form });\n// Discord expects the avatar as a data: URI in a JSON body, not multipart form data.';
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify(dump)}}}]}`,
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    } else {
+      sse(res, [
+        '{"choices":[{"delta":{"content":"Fixed it."}}]}',
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    }
+  },
+  // Z26: a fenced code block that merely mentions a path is a real answer and
+  // must NOT be retried.
+  "t-legit-code-answer": (req, res) => {
+    const answer = 'Here is the file:\n```ts\nC:\\Users\\User\\Desktop\\EXPERIMENTS\\DISCORD\\CHATBOT\\tmp\\applyavatars.ts\nconst a = 1;\n```\nDone.';
+    sse(res, [
+      `{"choices":[{"delta":{"content":${JSON.stringify(answer)}}}]}`,
+      '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+      "[DONE]",
+    ]);
   },
   // Z: role-only chunk committed, then a 503 before any visible content ->
   // the proxy must retry instead of ending an empty turn.
@@ -1022,8 +1063,21 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     check("Z23: truncated edit retried, raw DSML never forwarded", hitCount === 2 && bufTrunc && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `hits=${hitCount} text=${JSON.stringify(r.text)}`);
 
     hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-tiny-chunk-edit", stream: true }, BUFFER_PORT);
+    const tinyEdit = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; const a = JSON.parse(tc?.function?.arguments || "{}"); return tc?.function?.name === "edit" && String(a.newString).includes("The header names the state only"); } catch { return false; } });
+    check("Z27: tiny-chunk edit converted without retry", hitCount === 1 && tinyEdit && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `hits=${hitCount} text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
     r = await readSSE("/v1/chat/completions", { model: "t-dsml-garbage-retry", stream: true }, BUFFER_PORT);
     check("Z24: unparseable DSML retried into clean text", hitCount === 2 && textOf(r.text).includes("All good.") && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `hits=${hitCount} text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-bare-path-code-dump-retry", stream: true }, BUFFER_PORT);
+    check("Z25: bare path + code dump retried, file content never shown", hitCount === 2 && textOf(r.text).includes("Fixed it.") && !r.text.includes("FormData") && r.text.includes("[DONE]"), `hits=${hitCount} text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-legit-code-answer", stream: true }, BUFFER_PORT);
+    check("Z26: fenced code answer not retried", hitCount === 1 && textOf(r.text).includes("const a = 1;") && textOf(r.text).includes("Done."), `hits=${hitCount} text=${JSON.stringify(r.text)}`);
 
     bufferProxy.kill();
   } catch (e) {

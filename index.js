@@ -124,6 +124,11 @@
 // rev: 2.24 — /status tracks each streaming request separately (image
 //      generations cannot overwrite retry state), reports `first try` while an
 //      attempt is in flight, and marks the retry before the backoff wait.
+// rev: 2.25 — DSML split across many small chunks is converted by the buffer
+//      post-process instead of being treated as a cut and retried forever; a
+//      raw-SSE scan guarantees unconvertible DSML is retried, never forwarded.
+//      /status groups streams by x-opencode-session-id so the pill shows
+//      `failed: N` for its own session only.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -251,18 +256,23 @@ function looksLikeTextToolCall(text) {
 }
 
 // A bare path followed by file content (no edit/write keyword, no DSML tags)
-// right after narration like "the edit didn't apply / let me add..." is a
-// malformed tool call, not an answer. Buffer mode retries it.
+// is a malformed tool call, not an answer. The narration before it is not
+// reliable ("Let me fix that."), so the shape decides: a line-start path whose
+// very next text is code (not a fenced example) is a file dump. Buffer mode
+// retries it. A fenced code block after a path is a legitimate answer.
 function looksLikeBarePathEdit(text) {
   const t = String(text);
   if (t.length < 200) return false;
-  const m = t.match(/(?:^|\n)\s*([A-Za-z]:\\[^\n]*?\.(?:ts|tsx|js|jsx|py|cs|cpp|h|json|md))\b/);
+  const m = t.match(/(?:^|\n)\s*([A-Za-z]:\\[^\n]*?\.(?:ts|tsx|js|jsx|py|cs|cpp|h|json|md|txt|yml|yaml|toml))\b/);
   if (!m) return false;
   const before = t.slice(0, m.index);
+  // Inside a fenced block the path is part of an example, not a dump.
+  if (((before.match(/```/g) || []).length % 2) === 1) return false;
   const after = t.slice(m.index + m[0].length);
   if (after.length < 80) return false;
-  if (!/\b(edit|write|add|apply|update|change)\b/i.test(before)) return false;
-  return /[=:;{}]/.test(after);
+  const fence = after.indexOf("```");
+  const head = fence >= 0 ? after.slice(0, fence) : after.slice(0, 240);
+  return /(\bconst\b|\blet\b|\bvar\b|\bfunction\b|\bclass\b|\bimport\b|\bexport\b|\bawait\b|\breturn\b|\bif\s*\(|\bfor\s*\(|=>|[;{}])/.test(head);
 }
 
 // Conservative DSML read parser: logfare/deepseek sometimes streams
@@ -864,8 +874,15 @@ async function startServer(upstreamBase, port, mode) {
         "cache-control": "no-store",
       });
       let best = null;
+      const sessions = {};
       for (const s of proxyState.streams.values()) {
         if (!best || s.retries > best.retries || (s.retries === best.retries && s.updated > best.updated)) best = s;
+        if (s.sessionId) {
+          const cur = sessions[s.sessionId];
+          if (!cur || s.retries > cur.retries || (s.retries === cur.retries && s.updated > cur.updated)) {
+            sessions[s.sessionId] = { retries: s.retries, attempts: s.attempts, model: s.model, updated: s.updated };
+          }
+        }
       }
       res.end(JSON.stringify({
         active: proxyState.active,
@@ -874,6 +891,7 @@ async function startServer(upstreamBase, port, mode) {
         attempts: best ? best.attempts : 0,
         model: best ? best.model : null,
         updated: proxyState.updated,
+        sessions,
       }));
       return;
     }
@@ -903,9 +921,12 @@ async function startServer(upstreamBase, port, mode) {
     // Only streaming chat requests drive the retry pill. Non-stream image
     // generations must not overwrite a streaming request's retry state.
     let streamId = null;
+    // OpenCode sends x-opencode-session-id on every provider request, so the
+    // pill can show only its own session's failures.
+    const sessionId = String(req.headers["x-opencode-session-id"] || "") || null;
     if (wantsStream) {
       streamId = ++proxyState.streamSeq;
-      proxyState.streams.set(streamId, { attempts: 1, retries: 0, model, updated: Date.now() });
+      proxyState.streams.set(streamId, { sessionId, attempts: 1, retries: 0, model, updated: Date.now() });
       res.on("close", () => {
         proxyState.streams.delete(streamId);
         proxyState.updated = Date.now();
@@ -1057,7 +1078,7 @@ async function startServer(upstreamBase, port, mode) {
       }
     }
 
-    log(`req ${req.method} ${pathAndQuery} model=${model} stream=${wantsStream} bytes=${reqSize} max_tokens=${reqJson?.max_tokens ?? reqJson?.max_completion_tokens ?? "default"}`);
+    log(`req ${req.method} ${pathAndQuery} model=${model} stream=${wantsStream} bytes=${reqSize} max_tokens=${reqJson?.max_tokens ?? reqJson?.max_completion_tokens ?? "default"} session=${sessionId || "-"}`);
     if (clientGone) { stopEarlyHeaderTimer(); stopKeepalive(); log(`req ${pathAndQuery}: client gone, stop`); return; }
 
     let lastStatus = null;
@@ -1552,8 +1573,12 @@ async function startServer(upstreamBase, port, mode) {
             // regenerates it and the suffix starts with it (it was not sent).
             const finishContent = contentDelta(data);
             const combined = sentContent + finishContent;
-            const codeDump = looksLikePartialCode(combined);
-            const textTool = looksLikeTextToolCall(combined);
+            // DSML text is handled by the buffer post-process (the block may
+            // be split across many small chunks, so no single chunk matches).
+            // Retrying it here would loop forever instead of converting it.
+            const dsmlText = hasDsmlMarkers(combined);
+            const codeDump = !dsmlText && looksLikePartialCode(combined);
+            const textTool = !dsmlText && looksLikeTextToolCall(combined);
             // A DSML/text tool call streamed as content can finish with
             // tool_calls even though no structured tool call was sent. Treat
             // it like a code dump: retry, then hand off any real tool call.
@@ -1611,7 +1636,10 @@ async function startServer(upstreamBase, port, mode) {
             // is present; retry the whole request instead.
             if (BUFFER_UNTIL_COMPLETE && !sawFinish && !sawToolCalls && !syntheticToolCall) {
               const combined = sentContent;
-              if (looksIncomplete(combined) || looksLikePartialCode(combined) || looksLikeTextToolCall(combined) || looksLikeBarePathEdit(combined)) {
+              const dsmlText = hasDsmlMarkers(combined);
+              if (looksIncomplete(combined)
+                  || (!dsmlText && (looksLikePartialCode(combined) || looksLikeTextToolCall(combined)))
+                  || looksLikeBarePathEdit(combined)) {
                 bufferAbrupt = true;
                 return null;
               }
@@ -1712,7 +1740,11 @@ async function startServer(upstreamBase, port, mode) {
           const incompleteEdit = isIncompleteDsmlEdit(joinedAll);
           // Raw DSML that no parser can convert (truncated block, unknown
           // shape) is a broken turn: retry instead of showing it to the client.
-          const unconvertibleDsml = hasDsmlMarkers(joinedAll) && !parseAnyDsml(joinedAll);
+          // Scan the raw buffered SSE too, so a reconstruction gap can never
+          // leak DSML text.
+          const rawBuffered = buffered.map(String).join("");
+          const dsmlPresent = hasDsmlMarkers(joinedAll) || hasDsmlMarkers(rawBuffered);
+          const unconvertibleDsml = dsmlPresent && !parseAnyDsml(joinedAll);
           const complete = !bufferAbrupt && !bufferFailed && !incompleteEdit && !unconvertibleDsml && (sawDone || sawFinish);
           if (complete) {
             ensureStreamHeaders({}, retryCount);
