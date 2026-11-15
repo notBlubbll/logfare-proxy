@@ -21,6 +21,9 @@ const ABRUPT_FULL = ABRUPT_PREFIX + " realized should live in the persona's own 
 const DASH_PREFIX = "Internal #bot-status: 3 individual per-bot cards with everything per-bot (description, Age, Awake, Replies, Avg response, Tokens, In/out) —";
 const DASH_FULL = DASH_PREFIX + " plus the remaining per-bot metrics and the final card layout.";
 const COMPLETE_TEXT = "This answer is already complete and ends with a period, so it must not be continued by the proxy.";
+const FINISH_PREFIX = "interface StatusCardRow { showProviderUsage: boolean; showProfile: boolean; showTokens: boolean; showTimings: boolean; showAvgResponse: boolean; showMeasuredLine: boolean; showAggregateModel: boolean; }\n\n";
+const FINISH_TAIL = "interface StatusCardRow {";
+const FINISH_FULL = FINISH_PREFIX + "interface StatusCardRow {\n  id: string;\n  showProviderUsage: boolean;\n}";
 
 function sse(res, events, opts = {}) {
   res.writeHead(200, { "content-type": "text/event-stream", ...opts.headers });
@@ -293,6 +296,24 @@ const scenarios = {
       ]);
     }
   },
+  // Z3: the final chunk carries new content together with finish_reason; the
+  // completeness check must include it (here it ends with "{").
+  "t-abrupt-finish-content": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify(FINISH_PREFIX)}}}]}`,
+        `{"choices":[{"delta":{"content":${JSON.stringify(FINISH_TAIL)}},"finish_reason":"stop"}]}`,
+        "[DONE]",
+      ]);
+    } else {
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify(FINISH_FULL)}}}]}`,
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    }
+  },
   // Z: role-only chunk committed, then a 503 before any visible content ->
   // the proxy must retry instead of ending an empty turn.
   "t-empty-503-retry": (req, res) => {
@@ -489,6 +510,11 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     r = await readSSE("/v1/chat/completions", { model: "t-abrupt-dash-continue", stream: true });
     const z2Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
     check("Z2: stop after em dash continued", textOf(r.text) === DASH_FULL && !z2Err && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-abrupt-finish-content", stream: true });
+    const z3Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    check("Z3: finish-chunk content included in incomplete check", textOf(r.text) === FINISH_FULL && !z3Err && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     // N: text model + image -> vision model captions it, text model gets text only
     const imgBody = {

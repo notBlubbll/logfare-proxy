@@ -82,6 +82,8 @@
 //      instead of closing an empty turn.
 // rev: 2.7 — punctuation coverage: a stop after a Unicode dash (—, –, ―, −)
 //      is treated as mid-thought, like an ASCII hyphen; opening brackets too.
+// rev: 2.8 — finish-chunk content: the terminal chunk can carry new text
+//      together with finish_reason; include it in the incompleteness check.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -1052,16 +1054,21 @@ async function startServer(upstreamBase, port, mode) {
           }
           const finishReason = finishReasonOf(data);
           if (finishReason !== null) {
-            const abrupt = (finishReason === "stop" || finishReason === "length") && looksIncomplete(sentContent);
+            // The final chunk can carry content together with finish_reason.
+            // Include it in the completeness check; if we continue, the retry
+            // regenerates it and the suffix starts with it (it was not sent).
+            const finishContent = contentDelta(data);
+            const combined = sentContent + finishContent;
+            const abrupt = (finishReason === "stop" || finishReason === "length") && looksIncomplete(combined);
             if (abrupt && !sawToolCalls && sentContent.length > 0 && continuationAttempts < MAX_CONTINUATION
                 && (continuationPrefix === null || continuationEmitted > 0)) {
               continuationPrefix = sentContent;
               continuationAttempts++;
-              log(`abrupt ${finishReason} mid-answer; continuation ${continuationAttempts}/${MAX_CONTINUATION} after ${sentContent.length} chars`);
+              log(`abrupt ${finishReason} mid-answer; continuation ${continuationAttempts}/${MAX_CONTINUATION} after ${combined.length} chars`);
               return { bail: `post-commit continuation (${finishReason})`, rateLimited: false, neverForward: true, postCommit: true };
             }
             sawFinish = true;
-            log(`finish_reason=${finishReason} chars=${sentContent.length}`);
+            log(`finish_reason=${finishReason} chars=${combined.length}`);
           }
           if (verdict.kind === "repair") {
             commitData();
