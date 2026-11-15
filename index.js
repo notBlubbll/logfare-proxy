@@ -107,6 +107,8 @@
 //      tool call; parameter values stop at closing DSML tags.
 // rev: 2.17 — DSML grep conversion: pattern + path + include -> real grep
 //      tool call (checked before read).
+// rev: 2.18 — DSML write conversion: content + path -> real write tool call
+//      (requires a closing tag; checked before grep/edit/read).
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -277,6 +279,25 @@ function parseDsmlRead(text) {
   const limit = Number(param("limit"));
   if (Number.isFinite(limit)) args.limit = limit;
   return { name: "read", arguments: args };
+}
+
+// Conservative DSML write parser: `content` + `path`. Requires a closing
+// DSML tag so a truncated block is never written to disk.
+function parseDsmlWrite(text) {
+  const t = String(text);
+  if (!t.includes("< | DSML |") && !t.includes("</ | DSML |")) return null;
+  const param = (name) => {
+    const re = new RegExp(`<\\s*\\|\\s*DSML\\s*\\|\\s*parameter\\s+name="${name}"\\s+string="(?:true|false)">([\\s\\S]*?)(?=<\\s*\\/?\\s*\\|\\s*DSML\\s*\\||$)`);
+    const m = t.match(re);
+    return m ? m[1].trim() : null;
+  };
+  const content = param("content");
+  if (!content) return null;
+  const filePath = param("path");
+  if (!filePath) return null;
+  const closed = t.includes("</ | DSML | parameter>") || t.includes("</ | DSML | parameter >") || t.includes("</ | DSML | invoke>");
+  if (!closed) return null;
+  return { name: "write", arguments: { filePath, content } };
 }
 
 // Conservative DSML grep parser: a `pattern` parameter means grep, not read.
@@ -1245,6 +1266,28 @@ async function startServer(upstreamBase, port, mode) {
             sawToolCalls = true;
             syntheticToolCall = true;
             log(`converted DSML edit to tool_calls: ${dsmlEdit.arguments.filePath}`);
+            return null;
+          }
+          // Convert a text DSML write block into a real write tool call.
+          const dsmlWrite = parseDsmlWrite(contentDelta(data));
+          if (dsmlWrite) {
+            commitData();
+            const call = {
+              choices: [{
+                delta: {
+                  tool_calls: [{
+                    index: 0,
+                    id: `call_dsml_${++dsmlCallSeq}`,
+                    type: "function",
+                    function: { name: dsmlWrite.name, arguments: JSON.stringify(dsmlWrite.arguments) },
+                  }],
+                },
+              }],
+            };
+            try { res.write(`data: ${JSON.stringify(call)}\n\n`); } catch {}
+            sawToolCalls = true;
+            syntheticToolCall = true;
+            log(`converted DSML write to tool_calls: ${dsmlWrite.arguments.filePath}`);
             return null;
           }
           // Convert a text DSML grep block into a real grep tool call.

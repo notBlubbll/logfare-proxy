@@ -506,6 +506,16 @@ const scenarios = {
       "[DONE]",
     ]);
   },
+  // Z17: DSML write (content + path) -> real write tool call.
+  "t-dsml-write-toolcall": (req, res) => {
+    const sql = "-- Per-bot avatar, so each bot's face can be set\n-- from Discord instead of by hand at the API.\nALTER TABLE bot_identities ADD COLUMN IF NOT EXISTS avatar_hash TEXT;";
+    const dsml = `< | DSML | parameter name="content" string="true">${sql}< | DSML | parameter name="path" string="true">C:\\Users\\User\\Desktop\\EXPERIMENTS\\DISCORD\\CHATBOT\\src\\db\\migrations\\145_bot_identity_avatar.sql</ | DSML | parameter>`;
+    sse(res, [
+      `{"choices":[{"delta":{"content":${JSON.stringify(dsml)}}}]}`,
+      '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+      "[DONE]",
+    ]);
+  },
   // Z: role-only chunk committed, then a 503 before any visible content ->
   // the proxy must retry instead of ending an empty turn.
   "t-empty-503-retry": (req, res) => {
@@ -779,6 +789,13 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     const z16Finish = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
     check("Z16: DSML grep converted to tool call", z16Tool && z16Finish && !z16Err && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-dsml-write-toolcall", stream: true });
+    const z17Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    const z17Tool = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; const a = JSON.parse(tc?.function?.arguments || "{}"); return tc?.function?.name === "write" && String(a.filePath).includes("145_bot_identity_avatar.sql") && String(a.content).includes("ALTER TABLE bot_identities"); } catch { return false; } });
+    const z17Finish = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
+    check("Z17: DSML write converted to tool call", z17Tool && z17Finish && !z17Err && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
     // N: text model + image -> vision model captions it, text model gets text only
     const imgBody = {
       model: "vision-text",
@@ -863,6 +880,11 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     r = await readSSE("/v1/chat/completions", { model: "t-dsml-grep-toolcall", stream: true }, BUFFER_PORT);
     const bufGrep = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; const a = JSON.parse(tc?.function?.arguments || "{}"); return tc?.function?.name === "grep" && a.pattern === "async setAvatar|webhook_avatar_url" && String(a.path).includes("PersonaRepository.ts"); } catch { return false; } });
     check("BUF: DSML grep converted to tool call", bufGrep && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-dsml-write-toolcall", stream: true }, BUFFER_PORT);
+    const bufWrite = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; const a = JSON.parse(tc?.function?.arguments || "{}"); return tc?.function?.name === "write" && String(a.filePath).includes("145_bot_identity_avatar.sql") && String(a.content).includes("ALTER TABLE bot_identities"); } catch { return false; } });
+    check("BUF: DSML write converted to tool call", bufWrite && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     bufferProxy.kill();
   } catch (e) {

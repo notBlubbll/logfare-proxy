@@ -166,7 +166,7 @@ Per-request overrides (stripped before forwarding): `x-lf-upstream`,
 bun test/run-tests.mjs
 ```
 
-Spins a mock upstream plus the proxy and asserts 51 scenarios: pre-commit
+Spins a mock upstream plus the proxy and asserts 53 scenarios: pre-commit
 retry, post-commit drop, in-band error retry, give-up after exactly 10 retries,
 null-field repair, mid-stream healing, non-stream passthrough, bulk-JSON
 conversion, stall retry, 200+8006 same-body retry, budget exhaustion surfacing
@@ -182,11 +182,11 @@ finish chunk), empty-turn recovery (retry when a role-only chunk precedes a
 (including after a prior tool call, for any large code-like output, and for
 text tool calls such as `edit <path>`, and DSML read blocks converted to real
 `read` tool calls, including the bare-path form, DSML edit blocks converted to
-real `edit` tool calls, and DSML grep blocks converted to real `grep` tool
-calls). The suite runs the 44 streaming scenarios with buffer mode off and
-seven buffer-mode scenarios (cut retried transparently, DSML read, bare-path
-DSML read, DSML edit, DSML grep, abrupt stop, and `[DONE]` without
-finish_reason).
+real `edit` tool calls, DSML grep blocks converted to real `grep` tool calls,
+and DSML write blocks converted to real `write` tool calls). The suite runs the
+46 streaming scenarios with buffer mode off and seven buffer-mode scenarios
+(cut retried transparently, DSML read, bare-path DSML read, DSML edit, DSML
+grep, DSML write, abrupt stop, and `[DONE]` without finish_reason).
 
 ## Desktop working timer (optional)
 
