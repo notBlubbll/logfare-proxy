@@ -274,6 +274,23 @@ const scenarios = {
       "[DONE]",
     ]);
   },
+  // Z: role-only chunk committed, then a 503 before any visible content ->
+  // the proxy must retry instead of ending an empty turn.
+  "t-empty-503-retry": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      sse(res, [
+        '{"choices":[{"delta":{"role":"assistant"}}]}',
+        '{"error":{"message":"Service temporarily unavailable","type":"server_error"}}',
+      ]);
+    } else {
+      sse(res, [
+        '{"choices":[{"delta":{"content":"recovered-after-empty-503"}}]}',
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    }
+  },
 };
 
 const mock = createServer((req, res) => {
@@ -442,6 +459,12 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     r = await readSSE("/v1/chat/completions", { model: "t-abrupt-stop-complete", stream: true });
     const yErr = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
     check("Y: complete stop not continued", textOf(r.text) === COMPLETE_TEXT && hits.length - hitsBeforeY === 1 && !yErr, `hits=${hits.length - hitsBeforeY} text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    const hitsBeforeZ = hits.length;
+    r = await readSSE("/v1/chat/completions", { model: "t-empty-503-retry", stream: true });
+    const zErr = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    check("Z: empty 503 after role chunk retried", textOf(r.text) === "recovered-after-empty-503" && hits.length - hitsBeforeZ === 2 && !zErr && r.text.includes("[DONE]"), `hits=${hits.length - hitsBeforeZ} text=${JSON.stringify(r.text)}`);
 
     // N: text model + image -> vision model captions it, text model gets text only
     const imgBody = {

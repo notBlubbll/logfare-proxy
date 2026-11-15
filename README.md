@@ -166,7 +166,7 @@ Per-request overrides (stripped before forwarding): `x-lf-upstream`,
 bun test/run-tests.mjs
 ```
 
-Spins a mock upstream plus the proxy and asserts 29 scenarios: pre-commit
+Spins a mock upstream plus the proxy and asserts 30 scenarios: pre-commit
 retry, post-commit drop, in-band error retry, give-up after exactly 10 retries,
 null-field repair, mid-stream healing, non-stream passthrough, bulk-JSON
 conversion, stall retry, 200+8006 same-body retry, budget exhaustion surfacing
@@ -175,8 +175,9 @@ model), and caption caching (no second vision call). Newer cases also cover
 transient `Service temporarily unavailable` retries (no budget), post-commit
 suppression of that error, `finish_reason` injection before `[DONE]`/close, and
 clean closes without `[DONE]`, post-commit continuation (retry + prefix-skip
-after a cut or transient error), and abrupt-stop continuation
-(`finish_reason=stop` mid-sentence).
+after a cut or transient error), abrupt-stop continuation
+(`finish_reason=stop` mid-sentence), and empty-turn recovery (retry when a
+role-only chunk precedes a 503).
 
 ## Desktop working timer (optional)
 

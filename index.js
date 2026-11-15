@@ -77,6 +77,9 @@
 //      finish_reason=stop mid-sentence. If the streamed text looks incomplete
 //      (prose ending in a word/comma/colon, or an unclosed code fence), the
 //      proxy treats it as a cut and uses the same prefix-skip continuation.
+// rev: 2.6 — empty-turn recovery: a role-only chunk can commit headers before
+//      a 503, leaving zero visible content. The proxy now retries that case
+//      instead of closing an empty turn.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -1018,6 +1021,14 @@ async function startServer(upstreamBase, port, mode) {
           // desktop retry the whole turn ("Attempt N - retrying"). Close the
           // stream cleanly instead.
           if (isErrorPayload(data) && dataCommitted && NEVER_FORWARD_RE.test(data)) {
+            // Headers may have been committed by early SSE/keepalives or a
+            // role-only chunk, but no visible content was sent. Retrying is
+            // safe and recovers empty 503 turns.
+            if (sentContent.length === 0 && !sawToolCalls && continuationAttempts < MAX_CONTINUATION) {
+              continuationAttempts++;
+              log(`POST-commit never-forward error before any content; retrying ${continuationAttempts}/${MAX_CONTINUATION}`);
+              return { bail: `post-commit empty retry`, rateLimited: false, neverForward: true, postCommit: true };
+            }
             if (!sawFinish && !sawToolCalls && sentContent.length > 0 && continuationAttempts < MAX_CONTINUATION
                 && (continuationPrefix === null || continuationEmitted > 0)) {
               continuationPrefix = sentContent;
