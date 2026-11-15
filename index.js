@@ -100,6 +100,9 @@
 // rev: 2.14 — buffer-until-complete (default): SSE responses are buffered and
 //      flushed only after a complete turn; failures retry transparently with
 //      no partial output. LOGFARE_PROXY_BUFFER=0 restores streaming.
+// rev: 2.15 — DSML read variants: accept the bare path before the parameter
+//      tags; buffer mode refuses to flush [DONE] without finish_reason when
+//      the answer is incomplete.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -235,7 +238,13 @@ function parseDsmlRead(text) {
     const m = t.match(re);
     return m ? m[1].trim() : null;
   };
-  const filePath = param("path");
+  let filePath = param("path");
+  if (!filePath) {
+    // Some DSML read blocks put the bare path first:
+    //   C:\...\file.ts</ | DSML | parameter > < | DSML | parameter name="offset" ...
+    const bare = t.match(/(?:^|\n)\s*([A-Za-z]:\\[^\n<]+?|\/[^\n<]+?)\s*<\s*\/\s*\|\s*DSML\s*\|\s*parameter\s*>/);
+    if (bare) filePath = bare[1].trim();
+  }
   if (!filePath) return null;
   const args = { filePath };
   const offset = Number(param("offset"));
@@ -1231,6 +1240,16 @@ async function startServer(upstreamBase, port, mode) {
           // a schema-valid terminal chunk before forwarding [DONE].
           if (data === "[DONE]") {
             commitData();
+            // Buffer mode: [DONE] can arrive without a finish_reason. Do not
+            // flush an incomplete/DSML/text-tool-call answer just because DONE
+            // is present; retry the whole request instead.
+            if (BUFFER_UNTIL_COMPLETE && !sawFinish && !sawToolCalls && !syntheticToolCall) {
+              const combined = sentContent;
+              if (looksIncomplete(combined) || looksLikePartialCode(combined) || looksLikeTextToolCall(combined)) {
+                bufferAbrupt = true;
+                return null;
+              }
+            }
             if (!sawFinish) {
               try { res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`); } catch {}
               sawFinish = true;

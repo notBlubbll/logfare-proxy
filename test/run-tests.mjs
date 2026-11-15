@@ -433,6 +433,32 @@ const scenarios = {
       "[DONE]",
     ]);
   },
+  // Z11: content + [DONE] with no finish_reason; buffer mode must not flush
+  // an incomplete answer just because DONE arrived.
+  "t-done-no-finish-abrupt": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify(ABRUPT_PREFIX)}}}]}`,
+        "[DONE]",
+      ]);
+    } else {
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify(ABRUPT_FULL)}}}]}`,
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    }
+  },
+  // Z12: DSML read with the bare path before the parameter tags.
+  "t-dsml-bare-read": (req, res) => {
+    const dsml = 'C:\\Users\\User\\Desktop\\EXPERIMENTS\\DISCORD\\CHATBOT\\src\\utils\\discord\\interactions\\botConfigRoutes.ts</ | DSML | parameter > < | DSML | parameter name="offset" string="false">52< | DSML | parameter > < | DSML | parameter name="limit" string="false">28< | DSML | parameter > </ | DSML | invoke>';
+    sse(res, [
+      `{"choices":[{"delta":{"content":${JSON.stringify(dsml)}}}]}`,
+      '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+      "[DONE]",
+    ]);
+  },
   // Z: role-only chunk committed, then a 503 before any visible content ->
   // the proxy must retry instead of ending an empty turn.
   "t-empty-503-retry": (req, res) => {
@@ -678,6 +704,13 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     const z10NoDsml = !r.text.includes("< | DSML |");
     check("Z10: DSML read converted to tool call", z10Tool && z10Finish && z10NoDsml && !z10Err && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-dsml-bare-read", stream: true });
+    const z12Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    const z12Tool = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; const a = JSON.parse(tc?.function?.arguments || "{}"); return tc?.function?.name === "read" && String(a.filePath).includes("botConfigRoutes.ts") && a.offset === 52 && a.limit === 28; } catch { return false; } });
+    const z12Finish = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
+    check("Z12: bare-path DSML read converted", z12Tool && z12Finish && !z12Err && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
     // N: text model + image -> vision model captions it, text model gets text only
     const imgBody = {
       model: "vision-text",
@@ -738,6 +771,15 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     hitCount = 0;
     r = await readSSE("/v1/chat/completions", { model: "t-abrupt-stop-continue", stream: true }, BUFFER_PORT);
     check("BUF: abrupt stop retried transparently", textOf(r.text) === ABRUPT_FULL && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-done-no-finish-abrupt", stream: true }, BUFFER_PORT);
+    check("BUF: [DONE] without finish_reason still retried when incomplete", textOf(r.text) === ABRUPT_FULL && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-dsml-bare-read", stream: true }, BUFFER_PORT);
+    const bufBare = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; return tc?.function?.name === "read"; } catch { return false; } });
+    check("BUF: bare-path DSML read converted", bufBare && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     bufferProxy.kill();
   } catch (e) {
