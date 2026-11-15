@@ -1,6 +1,8 @@
 // working-timer — OpenCode Desktop GUI part.
 //
 // Shows "Working (20s)" as a composer pill while the routed session is running.
+// It polls the logfare proxy's /status endpoint and appends the live retry
+// count ("Working (20s · retry 2)") when the proxy is retrying.
 // Uses only the experimental desktop plugin API (@opencode/plugin/gui): no ASAR
 // patching, no app rebuild. The pill row sits above the composer beside the
 // app's own background/todo pills.
@@ -13,6 +15,8 @@ const { createSignal } = require("solid-js");
 
 // One shared 1s ticker per window; the host re-runs `show` when `tick()` is read.
 const [tick, setTick] = createSignal(0);
+// Live proxy retry count, refreshed from http://127.0.0.1:17330/status.
+const [retry, setRetry] = createSignal(0);
 
 function formatSeconds(total) {
   if (total < 60) return `${total}s`;
@@ -45,20 +49,32 @@ module.exports = {
     i18n: { en: { working: "Working" } },
     setup(ctx) {
       const timer = setInterval(() => setTick((n) => n + 1), 1000);
+      const poll = setInterval(async () => {
+        try {
+          const r = await fetch("http://127.0.0.1:17330/status", { cache: "no-store" });
+          if (!r.ok) { setRetry(0); return; }
+          const j = await r.json();
+          setRetry(j && j.active > 0 ? (j.retries || 0) : 0);
+        } catch { setRetry(0); }
+      }, 1000);
       ctx.add(ComposerPill, {
         id: "working-timer",
         show(input) {
           tick(); // reactive: re-run this pill once per second
           const seconds = elapsedSeconds(input.session);
           if (seconds === null) return undefined;
+          const r = retry();
+          const label = r > 0
+            ? `${ctx.t("working")} (${formatSeconds(seconds)} · retry ${r})`
+            : `${ctx.t("working")} (${formatSeconds(seconds)})`;
           return {
             id: "working",
-            label: `${ctx.t("working")} (${formatSeconds(seconds)})`,
+            label,
             title: ctx.t("working"),
           };
         },
       });
-      return () => clearInterval(timer);
+      return () => { clearInterval(timer); clearInterval(poll); };
     },
   }),
 };
