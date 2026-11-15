@@ -90,6 +90,8 @@
 //      cuts (one retry, no-progress guard stops repeats).
 // rev: 2.10 — code-dump continuation after tool calls: a prior Read/tool call
 //      no longer blocks the dump retry; finish diagnostics log toolCalls.
+// rev: 2.11 — broad code-dump fallback: any large code-like output (braces/
+//      semicolons) is treated as a possible cut, not only path/DSML-marked.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -192,7 +194,10 @@ function looksLikePartialCode(text) {
   if (t.length < 1500) return false;
   const hasFile = /(^|\n)[A-Za-z]:\\[^\n]+\.(?:ts|tsx|js|jsx|py|cs|cpp|h|json|md)\b/.test(t)
     || /(^|\n)\/[^\n]+\.(?:ts|tsx|js|jsx|py|cs|cpp|h|json|md)\b/.test(t);
-  return hasFile || t.includes("< | DSML |") || t.includes("</ | DSML |");
+  if (hasFile || t.includes("< | DSML |") || t.includes("</ | DSML |")) return true;
+  // Fallback: any large code-like output (braces/semicolons) that stopped.
+  // The no-progress guard limits this to one extra retry.
+  return /[{};]/.test(t);
 }
 
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));

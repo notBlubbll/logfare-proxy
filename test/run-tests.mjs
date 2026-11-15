@@ -26,6 +26,8 @@ const FINISH_TAIL = "interface StatusCardRow {";
 const FINISH_FULL = FINISH_PREFIX + "interface StatusCardRow {\n  id: string;\n  showProviderUsage: boolean;\n}";
 const CODE_PREFIX = "C:\\Users\\User\\Desktop\\EXPERIMENTS\\DISCORD\\CHATBOT\\src\\modules\\status-card\\index.ts\n" + "const value = 1;\n".repeat(100) + "}); }";
 const CODE_FULL = CODE_PREFIX + "\n// continued\nconst more = 2;";
+const PLAIN_CODE_PREFIX = "function buildCard() {\n" + "  const value = 1;\n".repeat(100) + "  return value;\n}";
+const PLAIN_CODE_FULL = PLAIN_CODE_PREFIX + "\n\nfunction finishCard() {\n  return true;\n}";
 
 function sse(res, events, opts = {}) {
   res.writeHead(200, { "content-type": "text/event-stream", ...opts.headers });
@@ -386,6 +388,24 @@ const scenarios = {
       ]);
     }
   },
+  // Z8: large code-like output without a file path/DSML marker still counts
+  // as a possible code dump.
+  "t-plain-code-dump": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify(PLAIN_CODE_PREFIX)}}}]}`,
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    } else {
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify(PLAIN_CODE_FULL)}}}]}`,
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    }
+  },
   // Z: role-only chunk committed, then a 503 before any visible content ->
   // the proxy must retry instead of ending an empty turn.
   "t-empty-503-retry": (req, res) => {
@@ -610,6 +630,11 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     const z7Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
     const z7Tool = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.choices?.[0]?.delta?.tool_calls; } catch { return false; } });
     check("Z7: code dump continued after a tool call", textOf(r.text) === CODE_FULL && z7Tool && !z7Err && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-plain-code-dump", stream: true });
+    const z8Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    check("Z8: large plain code dump continued", textOf(r.text) === PLAIN_CODE_FULL && !z8Err && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     // N: text model + image -> vision model captions it, text model gets text only
     const imgBody = {
