@@ -95,6 +95,8 @@
 // rev: 2.12 — text tool calls: retry when content contains "edit/write/read/
 //      shell <path>" or DSML instead of structured tool_calls; hand off the
 //      retry's real tool call.
+// rev: 2.13 — DSML read conversion: a DSML read block streamed as text is
+//      converted to a real read tool_calls delta; finish stop -> tool_calls.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -212,6 +214,29 @@ function looksLikeTextToolCall(text) {
     || /(^|\n)\s*(edit|write|read|shell|bash|apply_patch|patch)\s+\/[^\n]+/i.test(t)
     || t.includes("< | DSML |")
     || t.includes("</ | DSML |");
+}
+
+// Conservative DSML read parser: logfare/deepseek sometimes streams
+//   < | DSML | parameter name="limit" string="false">100
+//   < | DSML | parameter name="offset" string="false">140
+//   < | DSML | parameter name="path" string="true">C:\...\file.ts
+// as text. Convert it to a real, read-only `read` tool call.
+function parseDsmlRead(text) {
+  const t = String(text);
+  if (!t.includes("< | DSML |") && !t.includes("</ | DSML |")) return null;
+  const param = (name) => {
+    const re = new RegExp(`<\\s*\\|\\s*DSML\\s*\\|\\s*parameter\\s+name="${name}"\\s+string="(?:true|false)">([\\s\\S]*?)(?=<\\s*\\|\\s*DSML\\s*\\||$)`);
+    const m = t.match(re);
+    return m ? m[1].trim() : null;
+  };
+  const filePath = param("path");
+  if (!filePath) return null;
+  const args = { filePath };
+  const offset = Number(param("offset"));
+  if (Number.isFinite(offset)) args.offset = offset;
+  const limit = Number(param("limit"));
+  if (Number.isFinite(limit)) args.limit = limit;
+  return { name: "read", arguments: args };
 }
 
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -947,6 +972,8 @@ async function startServer(upstreamBase, port, mode) {
         let sawDone = false;
         let sawFinish = false;
         let sawToolCalls = false;
+        let syntheticToolCall = false;
+        let dsmlCallSeq = 0;
         let forwardedChars = 0;
         let lastErr = null;
         const commitData = () => {
@@ -1103,6 +1130,28 @@ async function startServer(upstreamBase, port, mode) {
             sawDone = true;
             return null;
           }
+          // Convert a text DSML read block into a real read tool call.
+          const dsmlRead = parseDsmlRead(contentDelta(data));
+          if (dsmlRead) {
+            commitData();
+            const call = {
+              choices: [{
+                delta: {
+                  tool_calls: [{
+                    index: 0,
+                    id: `call_dsml_${++dsmlCallSeq}`,
+                    type: "function",
+                    function: { name: dsmlRead.name, arguments: JSON.stringify(dsmlRead.arguments) },
+                  }],
+                },
+              }],
+            };
+            try { res.write(`data: ${JSON.stringify(call)}\n\n`); } catch {}
+            sawToolCalls = true;
+            syntheticToolCall = true;
+            log(`converted DSML read to tool_calls: ${dsmlRead.arguments.filePath}`);
+            return null;
+          }
           const finishReason = finishReasonOf(data);
           if (finishReason !== null) {
             // The final chunk can carry content together with finish_reason.
@@ -1127,6 +1176,19 @@ async function startServer(upstreamBase, port, mode) {
               continuationAttempts++;
               log(`abrupt ${finishReason} mid-answer; continuation ${continuationAttempts}/${MAX_CONTINUATION} after ${combined.length} chars`);
               return { bail: `post-commit continuation (${finishReason})`, rateLimited: false, neverForward: true, postCommit: true };
+            }
+            if (syntheticToolCall && finishReason === "stop") {
+              sawFinish = true;
+              commitData();
+              let out = data;
+              try {
+                const j = JSON.parse(data);
+                for (const c of j.choices || []) if (c.finish_reason === "stop") c.finish_reason = "tool_calls";
+                out = JSON.stringify(j);
+              } catch {}
+              try { res.write(`data: ${out}\n\n`); } catch {}
+              log(`rewrote finish_reason stop -> tool_calls for DSML read`);
+              return null;
             }
             sawFinish = true;
             log(`finish_reason=${finishReason} chars=${combined.length} toolCalls=${sawToolCalls}`);

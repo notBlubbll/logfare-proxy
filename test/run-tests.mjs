@@ -424,6 +424,15 @@ const scenarios = {
       ]);
     }
   },
+  // Z10: DSML read block streamed as text -> convert to a real read tool call.
+  "t-dsml-read-toolcall": (req, res) => {
+    const dsml = '< | DSML | parameter name="limit" string="false">100< | DSML | parameter name="offset" string="false">140< | DSML | parameter name="path" string="true">C:\\Users\\User\\Desktop\\EXPERIMENTS\\DISCORD\\CHATBOT\\src\\utils\\discord\\interactions\\botConfigRoutes.ts';
+    sse(res, [
+      `{"choices":[{"delta":{"content":${JSON.stringify(dsml)}}}]}`,
+      '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+      "[DONE]",
+    ]);
+  },
   // Z: role-only chunk committed, then a 503 before any visible content ->
   // the proxy must retry instead of ending an empty turn.
   "t-empty-503-retry": (req, res) => {
@@ -660,6 +669,14 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     const z9Tool = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.choices?.[0]?.delta?.tool_calls; } catch { return false; } });
     const z9Finish = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
     check("Z9: text tool call retried and handed off", z9Tool && z9Finish && !z9Err && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-dsml-read-toolcall", stream: true });
+    const z10Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    const z10Tool = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; return tc?.function?.name === "read" && String(tc.function.arguments).includes("botConfigRoutes.ts"); } catch { return false; } });
+    const z10Finish = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
+    const z10NoDsml = !r.text.includes("< | DSML |");
+    check("Z10: DSML read converted to tool call", z10Tool && z10Finish && z10NoDsml && !z10Err && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     // N: text model + image -> vision model captions it, text model gets text only
     const imgBody = {
