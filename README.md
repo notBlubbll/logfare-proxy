@@ -157,6 +157,13 @@ bun index.js            # or: node index.js
 
 Health check: `GET /healthz` → `logfare-proxy OK`.
 
+Live telemetry: `GET /status` (CORS-enabled, `no-store`) returns
+`{active, streams, retries, attempts, model, updated}`. Only streaming chat
+requests are tracked, each in its own entry, so a concurrent image generation
+can never overwrite the retry state; `retries` is the highest retry count among
+active streams and resets when the last stream closes. The desktop working pill
+polls it to show `Working (20s · first try)` / `Working (20s · retry 2)`.
+
 Per-request overrides (stripped before forwarding): `x-lf-upstream`,
 `x-lf-key`.
 
@@ -166,7 +173,7 @@ Per-request overrides (stripped before forwarding): `x-lf-upstream`,
 bun test/run-tests.mjs
 ```
 
-Spins a mock upstream plus the proxy and asserts 60 scenarios: pre-commit
+Spins a mock upstream plus the proxy and asserts 62 scenarios: pre-commit
 retry, post-commit drop, in-band error retry, give-up after exactly 10 retries,
 null-field repair, mid-stream healing, non-stream passthrough, bulk-JSON
 conversion, stall retry, 200+8006 same-body retry, budget exhaustion surfacing
@@ -187,18 +194,22 @@ DSML write blocks converted to real `write` tool calls, and bare image paths
 converted to `read` calls, including when the path arrives after an early
 `finish_reason=stop`, and split DSML blocks consolidated from multiple content
 events), incomplete edits (oldString XOR newString) retried instead of
-converted, and DSML shell blocks converted to real `shell` tool calls). The
-suite runs the 48 streaming scenarios with buffer mode off and eleven
-buffer-mode scenarios (cut retried transparently, DSML read, bare-path DSML
-read, DSML edit, DSML grep, DSML write, DSML shell, bare image read,
-tool-call-after-finish, split DSML, incomplete edit retry, abrupt stop, and
-`[DONE]` without finish_reason).
+converted, truncated edits (both parameters but an unclosed `newString`)
+retried instead of forwarded, unparseable DSML shapes retried instead of shown
+raw, and DSML shell blocks converted to real `shell` tool calls). The suite
+runs the 48 streaming scenarios with buffer mode off and thirteen buffer-mode
+scenarios (cut retried transparently, DSML read, bare-path DSML read, DSML
+edit, DSML grep, DSML write, DSML shell, bare image read,
+tool-call-after-finish, split DSML, incomplete edit retry, truncated edit
+retry, unparseable DSML retry, abrupt stop, and `[DONE]` without
+finish_reason).
 
 ## Desktop working timer (optional)
 
 `desktop-working-timer/` is a small OpenCode Desktop GUI plugin (experimental
 `gui-experimental.cjs` API) that shows `Working (20s)` as a composer pill while
-the routed session is running. It needs no ASAR patching or app rebuild. Copy it
+the routed session is running, plus the proxy's live attempt state
+(`· first try` or `· retry N`) while a streaming request is in flight. It needs no ASAR patching or app rebuild. Copy it
 to `~/.config/opencode/plugins/working-timer/`, then run `opencode reload` and
 restart the desktop window. See `desktop-working-timer/README.md`.
 

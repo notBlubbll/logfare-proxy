@@ -572,6 +572,41 @@ const scenarios = {
       "[DONE]",
     ]);
   },
+  // Z23: truncated edit (both params, newString never closed) -> buffer mode
+  // retries instead of forwarding raw DSML or writing half a file.
+  "t-truncated-edit-retry": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      sse(res, [
+        '{"choices":[{"delta":{"content":"edit C:\\\\Users\\\\User\\\\Desktop\\\\EXPERIMENTS\\\\DISCORD\\\\CHATBOT\\\\tmp\\\\applyavatars.ts</ | DSML | parameter > < | DSML | parameter name=\\"oldString\\" string=\\"true\\">const A = 1;</ | DSML | parameter > < | DSML | parameter name=\\"newString\\" string=\\"true\\">const A = 2; // Apply the generated"}}]}',
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    } else {
+      sse(res, [
+        '{"choices":[{"delta":{"content":"edit C:\\\\Users\\\\User\\\\Desktop\\\\EXPERIMENTS\\\\DISCORD\\\\CHATBOT\\\\tmp\\\\applyavatars.ts</ | DSML | parameter > < | DSML | parameter name=\\"oldString\\" string=\\"true\\">const A = 1;</ | DSML | parameter > < | DSML | parameter name=\\"newString\\" string=\\"true\\">const A = 2;</ | DSML | parameter >"}}]}',
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    }
+  },
+  // Z24: unparseable DSML shape -> retry instead of showing raw DSML.
+  "t-dsml-garbage-retry": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      sse(res, [
+        '{"choices":[{"delta":{"content":"< | DSML | invoke name=\\"mystery\\">nonsense"}}]}',
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    } else {
+      sse(res, [
+        '{"choices":[{"delta":{"content":"All good."}}]}',
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    }
+  },
   // Z: role-only chunk committed, then a 503 before any visible content ->
   // the proxy must retry instead of ending an empty turn.
   "t-empty-503-retry": (req, res) => {
@@ -980,6 +1015,15 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     const bufShell = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; const a = JSON.parse(tc?.function?.arguments || "{}"); return tc?.function?.name === "shell" && String(a.command).includes("bun tsc") && a.timeout === 900000; } catch { return false; } });
     const bufShellFin = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
     check("BUF: DSML shell converted to tool call", bufShell && bufShellFin && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-truncated-edit-retry", stream: true }, BUFFER_PORT);
+    const bufTrunc = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; const a = JSON.parse(tc?.function?.arguments || "{}"); return tc?.function?.name === "edit" && a.oldString === "const A = 1;" && a.newString === "const A = 2;"; } catch { return false; } });
+    check("Z23: truncated edit retried, raw DSML never forwarded", hitCount === 2 && bufTrunc && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `hits=${hitCount} text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-dsml-garbage-retry", stream: true }, BUFFER_PORT);
+    check("Z24: unparseable DSML retried into clean text", hitCount === 2 && textOf(r.text).includes("All good.") && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `hits=${hitCount} text=${JSON.stringify(r.text)}`);
 
     bufferProxy.kill();
   } catch (e) {

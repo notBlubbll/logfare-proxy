@@ -117,6 +117,13 @@
 // rev: 2.21 — incomplete edit (oldString XOR newString) is a broken tool call:
 //      buffer mode retries the whole request instead of converting to read/write.
 // rev: 2.22 — DSML shell conversion: command + timeout -> real shell tool call.
+// rev: 2.23 — truncated edit (both parameters, unclosed newString) and any
+//      unparseable DSML shape are broken turns: buffer mode retries instead of
+//      forwarding raw DSML; a failed buffered attempt no longer poisons the
+//      next attempt's completeness check (sentContent reset).
+// rev: 2.24 — /status tracks each streaming request separately (image
+//      generations cannot overwrite retry state), reports `first try` while an
+//      attempt is in flight, and marks the retry before the backoff wait.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -129,7 +136,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const TAG = "[logfare-proxy]";
-const proxyState = { active: 0, retries: 0, attempts: 0, model: null, updated: 0 };
+// Live request telemetry for GET /status (drives the working pill's retry
+// suffix). Streaming requests are tracked per-request so one stream's retry
+// state can never leak into another stream (or a concurrent image generation).
+const proxyState = { active: 0, streams: new Map(), streamSeq: 0, updated: 0 };
 const UPSTREAM_DEFAULT = "https://logfare.ai/v1";
 const LISTEN_HOST = "127.0.0.1";
 const PORT_DEFAULT = 17330;
@@ -303,14 +313,20 @@ function parseBareImageRead(text, prior) {
   return { name: "read", arguments: { filePath: m[1] } };
 }
 
-// An edit with only one of oldString/newString is a broken tool call. Buffer
-// mode retries the whole request instead of converting it to a read/write.
+// A broken edit is a broken tool call. Buffer mode retries the whole request
+// instead of converting it to a read/write. Broken means: only one of
+// oldString/newString, or a newString whose tag never closes (truncated turn).
 function isIncompleteDsmlEdit(text) {
   const t = String(text);
   if (!t.includes("< | DSML |") && !t.includes("</ | DSML |")) return false;
   const hasOld = /parameter\s+name="oldString"/.test(t);
   const hasNew = /parameter\s+name="newString"/.test(t);
-  return (hasOld && !hasNew) || (!hasOld && hasNew);
+  if (hasOld !== hasNew) return true;
+  if (!hasOld) return false;
+  const newIdx = t.search(/parameter\s+name="newString"/);
+  const closeRe = /<\/\s*\|\s*DSML\s*\|\s*parameter\s*>/g;
+  closeRe.lastIndex = Math.max(0, newIdx);
+  return !closeRe.test(t);
 }
 
 // Conservative DSML shell parser: `command` + optional `timeout`.
@@ -389,7 +405,25 @@ function parseDsmlEdit(text) {
   const oldString = param("oldString");
   const newString = param("newString");
   if (!oldString || !newString) return null;
+  // The newString must itself be closed: a truncated block would otherwise
+  // become an edit that writes half a file.
+  const newIdx = t.search(/parameter\s+name="newString"/);
+  const closeRe = /<\/\s*\|\s*DSML\s*\|\s*parameter\s*>/g;
+  closeRe.lastIndex = Math.max(0, newIdx);
+  if (!closeRe.test(t)) return null;
   return { name: "edit", arguments: { filePath, oldString, newString } };
+}
+
+// True when the text contains DSML markers (raw tool-call syntax).
+function hasDsmlMarkers(text) {
+  const t = String(text);
+  return t.includes("< | DSML |") || t.includes("</ | DSML |");
+}
+
+// Try every DSML parser. Buffer mode uses this to decide whether a turn is
+// safe to forward: raw DSML that no parser can convert is a broken turn.
+function parseAnyDsml(text) {
+  return parseDsmlShell(text) || parseDsmlWrite(text) || parseDsmlGrep(text) || parseDsmlEdit(text) || parseDsmlRead(text);
 }
 
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -829,11 +863,16 @@ async function startServer(upstreamBase, port, mode) {
         "access-control-allow-origin": "*",
         "cache-control": "no-store",
       });
+      let best = null;
+      for (const s of proxyState.streams.values()) {
+        if (!best || s.retries > best.retries || (s.retries === best.retries && s.updated > best.updated)) best = s;
+      }
       res.end(JSON.stringify({
         active: proxyState.active,
-        retries: proxyState.retries,
-        attempts: proxyState.attempts,
-        model: proxyState.model,
+        streams: proxyState.streams.size,
+        retries: best ? best.retries : 0,
+        attempts: best ? best.attempts : 0,
+        model: best ? best.model : null,
         updated: proxyState.updated,
       }));
       return;
@@ -842,10 +881,7 @@ async function startServer(upstreamBase, port, mode) {
     proxyState.updated = Date.now();
     res.on("close", () => {
       proxyState.active = Math.max(0, proxyState.active - 1);
-      if (proxyState.active === 0) {
-        proxyState.retries = 0;
-        proxyState.attempts = 0;
-      }
+      proxyState.updated = Date.now();
     });
 
     // buffer the request body (retries need a replayable body)
@@ -864,6 +900,17 @@ async function startServer(upstreamBase, port, mode) {
       wantsStream = reqJson?.stream === true;
       model = reqJson?.model || "?";
     } catch {}
+    // Only streaming chat requests drive the retry pill. Non-stream image
+    // generations must not overwrite a streaming request's retry state.
+    let streamId = null;
+    if (wantsStream) {
+      streamId = ++proxyState.streamSeq;
+      proxyState.streams.set(streamId, { attempts: 1, retries: 0, model, updated: Date.now() });
+      res.on("close", () => {
+        proxyState.streams.delete(streamId);
+        proxyState.updated = Date.now();
+      });
+    }
 
     // shape diagnostic: log non-text content part types (never their payload)
     if (reqJson) {
@@ -1033,10 +1080,26 @@ async function startServer(upstreamBase, port, mode) {
     const MAX_CONTINUATION = 3;
     for (let attempt = 1; ; attempt++) {
       attemptsUsed = attempt;
-      proxyState.attempts = attempt;
-      proxyState.retries = attempt - 1;
-      proxyState.model = model;
-      proxyState.updated = Date.now();
+      if (wantsStream && streamId !== null) {
+        const s = proxyState.streams.get(streamId);
+        if (s) {
+          s.attempts = attempt;
+          s.retries = attempt - 1;
+          s.model = model;
+          s.updated = Date.now();
+        }
+        proxyState.updated = Date.now();
+      }
+      // Mark the retry BEFORE the backoff wait: the pill should say
+      // "retry N" while the user is waiting, not only during the next attempt.
+      const retryPause = async (ms) => {
+        if (wantsStream && streamId !== null) {
+          const s = proxyState.streams.get(streamId);
+          if (s) { s.retries = Math.max(s.retries, attempt); s.updated = Date.now(); }
+          proxyState.updated = Date.now();
+        }
+        await sleep(ms);
+      };
       if (clientGone) { stopKeepalive(); log(`req ${pathAndQuery}: client gone, stop`); return; }
       const retryCount = attempt - 1;
       let up = null;
@@ -1063,13 +1126,13 @@ async function startServer(upstreamBase, port, mode) {
             const wait = parseRetryAfterMs(up.headers["retry-after"]) || rateLimitBackoffMs(rlStreak++);
             if (!neverForward && Date.now() + wait >= rlDeadline) { log(`attempt ${attempt}: ${lastFailure} — patient budget exhausted`); break; }
             log(`attempt ${attempt}: ${lastFailure} — ${neverForward ? "never-forward transient" : "transient/rate-limited"}, retrying in ${Math.round(wait / 1000)}s`);
-            await sleep(wait);
+            await retryPause(wait);
             continue;
           }
           log(`attempt ${attempt}: ${lastFailure}`);
           hardFailures++;
           if (hardFailures > MAX_RETRIES) break;
-          await sleep(parseRetryAfterMs(up.headers["retry-after"]) || backoffMs(retryCount));
+          await retryPause(parseRetryAfterMs(up.headers["retry-after"]) || backoffMs(retryCount));
           continue;
         }
 
@@ -1133,12 +1196,12 @@ async function startServer(upstreamBase, port, mode) {
             const wait = parseRetryAfterMs(up.headers["retry-after"]) || rateLimitBackoffMs(rlStreak++);
             if (Date.now() + wait >= rlDeadline) { log(`patient budget exhausted`); break; }
             log(`retrying in ${Math.round(wait / 1000)}s (patient: 200-error body)`);
-            await sleep(wait);
+            await retryPause(wait);
             continue;
           }
           hardFailures++;
           if (hardFailures > MAX_RETRIES) break;
-          await sleep(backoffMs(retryCount));
+          await retryPause(backoffMs(retryCount));
           continue;
         }
 
@@ -1360,11 +1423,8 @@ async function startServer(upstreamBase, port, mode) {
             log(`converted DSML edit to tool_calls: ${dsmlEdit.arguments.filePath}`);
             return null;
           }
-          // Broken edit (oldString XOR newString): retry in buffer mode.
-          if (BUFFER_UNTIL_COMPLETE && isIncompleteDsmlEdit(contentDelta(data))) {
-            bufferAbrupt = true;
-            return null;
-          }
+          // Broken edits are judged on the whole buffered turn (a split block
+          // is fine until the turn ends), so nothing is decided per chunk.
           // Convert a bare image path into a real read tool call.
           const bareImage = parseBareImageRead(contentDelta(data), sentContent);
           if (bareImage) {
@@ -1648,8 +1708,12 @@ async function startServer(upstreamBase, port, mode) {
               if (typeof c === "string") joinedContent += c;
             } catch {}
           }
-          const incompleteEdit = isIncompleteDsmlEdit(dsmlRaw + joinedContent);
-          const complete = !bufferAbrupt && !bufferFailed && !incompleteEdit && (sawDone || sawFinish);
+          const joinedAll = dsmlRaw + joinedContent;
+          const incompleteEdit = isIncompleteDsmlEdit(joinedAll);
+          // Raw DSML that no parser can convert (truncated block, unknown
+          // shape) is a broken turn: retry instead of showing it to the client.
+          const unconvertibleDsml = hasDsmlMarkers(joinedAll) && !parseAnyDsml(joinedAll);
+          const complete = !bufferAbrupt && !bufferFailed && !incompleteEdit && !unconvertibleDsml && (sawDone || sawFinish);
           if (complete) {
             ensureStreamHeaders({}, retryCount);
             stopEarlyHeaderTimer();
@@ -1669,7 +1733,7 @@ async function startServer(upstreamBase, port, mode) {
                 } catch {}
               }
               if (text) {
-                const call = parseDsmlShell(text) || parseDsmlWrite(text) || parseDsmlGrep(text) || parseDsmlEdit(text) || parseDsmlRead(text) || parseBareImageRead(text, "");
+                const call = hasDsmlMarkers(text) ? parseAnyDsml(text) : parseBareImageRead(text, "");
                 if (call) {
                   const p = call.arguments.filePath || call.arguments.path || "";
                   const tagA = text.indexOf("< | DSML |");
@@ -1700,10 +1764,14 @@ async function startServer(upstreamBase, port, mode) {
           if (!bailed) lastFailure = `buffered stream failed (sawDone=${sawDone} sawFinish=${sawFinish} err=${lastErr?.message || lastErr || "none"})`;
           log(`req ${pathAndQuery}: buffered stream failed; retrying (${lastFailure})`);
           buffered.length = 0;
-          try { up.destroy(); } catch {}
+          // Nothing was sent to the client in buffer mode, so the failed
+          // attempt's text must not feed the next attempt's completeness
+          // checks (it made every retry look like a cut answer).
+          sentContent = "";
+          try { up.destroy(); } catch {};
           hardFailures++;
           if (hardFailures > MAX_RETRIES) break;
-          await sleep(backoffMs(retryCount));
+          await retryPause(backoffMs(retryCount));
           continue;
         }
         if (continuationFailed) {
@@ -1728,7 +1796,7 @@ async function startServer(upstreamBase, port, mode) {
             return;
           }
           log(`continuation retry ${continuationAttempts}/${MAX_CONTINUATION} after ${sentContent.length} chars`);
-          await sleep(backoffMs(retryCount));
+          await retryPause(backoffMs(retryCount));
           continue;
         }
         if (dataCommitted) {
@@ -1741,7 +1809,7 @@ async function startServer(upstreamBase, port, mode) {
             continuationAttempts++;
             log(`post-commit truncation; continuation ${continuationAttempts}/${MAX_CONTINUATION} after ${sentContent.length} chars`);
             try { up.destroy(); } catch {}
-            await sleep(backoffMs(retryCount));
+            await retryPause(backoffMs(retryCount));
             continue;
           }
           if (!sawDone) {
@@ -1786,12 +1854,12 @@ async function startServer(upstreamBase, port, mode) {
           const wait = rateLimitBackoffMs(rlStreak++);
           if (!bailedNeverForward && Date.now() + wait >= rlDeadline) { log(`rate-limit budget exhausted`); break; }
           log(`retrying in ${Math.round(wait / 1000)}s (${bailedNeverForward ? "never-forward transient" : "rate limit"})`);
-          await sleep(wait);
+          await retryPause(wait);
           continue;
         }
         hardFailures++;
         if (hardFailures > MAX_RETRIES) break;
-        await sleep(backoffMs(retryCount));
+        await retryPause(backoffMs(retryCount));
       } catch (err) {
         lastFailure = `attempt error: ${err?.message || err}`;
         log(`attempt ${attempt}: ${lastFailure}`);
@@ -1799,7 +1867,7 @@ async function startServer(upstreamBase, port, mode) {
         if (clientGone) { stopEarlyHeaderTimer(); stopKeepalive(); return; }
         hardFailures++;
         if (hardFailures > MAX_RETRIES) break;
-        await sleep(backoffMs(retryCount));
+        await retryPause(backoffMs(retryCount));
       }
     }
 

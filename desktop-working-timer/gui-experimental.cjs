@@ -15,8 +15,10 @@ const { createSignal } = require("solid-js");
 
 // One shared 1s ticker per window; the host re-runs `show` when `tick()` is read.
 const [tick, setTick] = createSignal(0);
-// Live proxy retry count, refreshed from http://127.0.0.1:17330/status.
-const [retry, setRetry] = createSignal(0);
+// Live proxy attempt state, refreshed from http://127.0.0.1:17330/status.
+// `live` is true while a streaming request is in flight; `retries` is that
+// request's retry count (0 = first try).
+const [proxy, setProxy] = createSignal({ live: false, retries: 0 });
 
 function formatSeconds(total) {
   if (total < 60) return `${total}s`;
@@ -52,10 +54,11 @@ module.exports = {
       const poll = setInterval(async () => {
         try {
           const r = await fetch("http://127.0.0.1:17330/status", { cache: "no-store" });
-          if (!r.ok) { setRetry(0); return; }
+          if (!r.ok) { setProxy({ live: false, retries: 0 }); return; }
           const j = await r.json();
-          setRetry(j && j.active > 0 ? (j.retries || 0) : 0);
-        } catch { setRetry(0); }
+          const streams = j && typeof j.streams === "number" ? j.streams : (j && j.active > 0 ? 1 : 0);
+          setProxy({ live: streams > 0, retries: (j && j.retries) || 0 });
+        } catch { setProxy({ live: false, retries: 0 }); }
       }, 1000);
       ctx.add(ComposerPill, {
         id: "working-timer",
@@ -63,10 +66,9 @@ module.exports = {
           tick(); // reactive: re-run this pill once per second
           const seconds = elapsedSeconds(input.session);
           if (seconds === null) return undefined;
-          const r = retry();
-          const label = r > 0
-            ? `${ctx.t("working")} (${formatSeconds(seconds)} · retry ${r})`
-            : `${ctx.t("working")} (${formatSeconds(seconds)})`;
+          const p = proxy();
+          const suffix = p.live ? (p.retries > 0 ? ` · retry ${p.retries}` : " · first try") : "";
+          const label = `${ctx.t("working")} (${formatSeconds(seconds)}${suffix})`;
           return {
             id: "working",
             label,
