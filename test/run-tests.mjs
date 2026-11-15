@@ -535,15 +535,33 @@ const scenarios = {
       "[DONE]",
     ]);
   },
-  // Z20: DSML block split across content events (path first, oldString later)
-  // -> buffer post-process consolidates into one read tool call.
+  // Z20: DSML read block split across content events (path first, offset/limit
+  // later) -> buffer post-process consolidates into one read tool call.
   "t-split-dsml-read": (req, res) => {
     sse(res, [
       '{"choices":[{"delta":{"content":"C:\\\\Users\\\\User\\\\Desktop\\\\EXPERIMENTS\\\\DISCORD\\\\CHATBOT\\\\src\\\\modules\\\\status-card\\\\index.ts</ | DSML | parameter >"}}]}',
-      '{"choices":[{"delta":{"content":" < | DSML | parameter name=\\"oldString\\" string=\\"true\\">const A = 1;"}}]}',
+      '{"choices":[{"delta":{"content":" < | DSML | parameter name=\\"offset\\" string=\\"false\\">0< | DSML | parameter name=\\"limit\\" string=\\"false\\">50"}}]}',
       '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
       "[DONE]",
     ]);
+  },
+  // Z21: incomplete edit (oldString but no newString) -> buffer mode retries
+  // instead of sending a read/write guess to the client.
+  "t-incomplete-edit-retry": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      sse(res, [
+        '{"choices":[{"delta":{"content":"edit C:\\\\Users\\\\User\\\\Desktop\\\\EXPERIMENTS\\\\DISCORD\\\\CHATBOT\\\\src\\\\modules\\\\status-card\\\\index.ts</ | DSML | parameter > < | DSML | parameter name=\\"oldString\\" string=\\"true\\">const A = 1;</ | DSML | parameter >"}}]}',
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    } else {
+      sse(res, [
+        '{"choices":[{"delta":{"content":"edit C:\\\\Users\\\\User\\\\Desktop\\\\EXPERIMENTS\\\\DISCORD\\\\CHATBOT\\\\src\\\\modules\\\\status-card\\\\index.ts</ | DSML | parameter > < | DSML | parameter name=\\"oldString\\" string=\\"true\\">const A = 1;</ | DSML | parameter > < | DSML | parameter name=\\"newString\\" string=\\"true\\">const A = 2;</ | DSML | parameter >"}}]}',
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    }
   },
   // Z: role-only chunk committed, then a 503 before any visible content ->
   // the proxy must retry instead of ending an empty turn.
@@ -938,6 +956,12 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     const bufSplit = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; return tc?.function?.name === "read" && String(tc.function.arguments).includes("status-card"); } catch { return false; } });
     const bufSplitFin = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
     check("BUF: split DSML consolidated into one read", bufSplit && bufSplitFin && !textOf(r.text).includes("oldString") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-incomplete-edit-retry", stream: true }, BUFFER_PORT);
+    const bufEditRetry = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; const a = JSON.parse(tc?.function?.arguments || "{}"); return tc?.function?.name === "edit" && a.oldString === "const A = 1;" && a.newString === "const A = 2;"; } catch { return false; } });
+    const bufEditRetryFin = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
+    check("BUF: incomplete edit retried into a complete edit", bufEditRetry && bufEditRetryFin && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     bufferProxy.kill();
   } catch (e) {

@@ -114,6 +114,8 @@
 // rev: 2.20 — split DSML consolidation: the whole buffered response is
 //      joined, converted into one tool call, and DSML text dropped; bare
 //      reads omit offset/limit when absent.
+// rev: 2.21 — incomplete edit (oldString XOR newString) is a broken tool call:
+//      buffer mode retries the whole request instead of converting to read/write.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -297,6 +299,16 @@ function parseBareImageRead(text, prior) {
   const before = `${String(prior || "")}\n${t.slice(0, m.index)}`.toLowerCase();
   if (!/(look|view|read|check|see|inspect|upload|avatar|image)/.test(before)) return null;
   return { name: "read", arguments: { filePath: m[1] } };
+}
+
+// An edit with only one of oldString/newString is a broken tool call. Buffer
+// mode retries the whole request instead of converting it to a read/write.
+function isIncompleteDsmlEdit(text) {
+  const t = String(text);
+  if (!t.includes("< | DSML |") && !t.includes("</ | DSML |")) return false;
+  const hasOld = /parameter\s+name="oldString"/.test(t);
+  const hasNew = /parameter\s+name="newString"/.test(t);
+  return (hasOld && !hasNew) || (!hasOld && hasNew);
 }
 
 // Conservative DSML write parser: `content` + `path`. Requires a closing
@@ -1300,6 +1312,11 @@ async function startServer(upstreamBase, port, mode) {
             log(`converted DSML edit to tool_calls: ${dsmlEdit.arguments.filePath}`);
             return null;
           }
+          // Broken edit (oldString XOR newString): retry in buffer mode.
+          if (BUFFER_UNTIL_COMPLETE && isIncompleteDsmlEdit(contentDelta(data))) {
+            bufferAbrupt = true;
+            return null;
+          }
           // Convert a bare image path into a real read tool call.
           const bareImage = parseBareImageRead(contentDelta(data), sentContent);
           if (bareImage) {
@@ -1549,7 +1566,18 @@ async function startServer(upstreamBase, port, mode) {
         if (BUFFER_UNTIL_COMPLETE) {
           try { res.write = rawWrite; } catch {}
           if (lastErr === "client-gone") { buffered.length = 0; return; }
-          const complete = !bufferAbrupt && !bufferFailed && (sawDone || sawFinish);
+          let joinedContent = "";
+          for (const chunk of buffered) {
+            const m = String(chunk).match(/^data: (.*)\n\n$/s);
+            if (!m) continue;
+            try {
+              const j = JSON.parse(m[1]);
+              const c = j?.choices?.[0]?.delta?.content;
+              if (typeof c === "string") joinedContent += c;
+            } catch {}
+          }
+          const incompleteEdit = isIncompleteDsmlEdit(dsmlRaw + joinedContent);
+          const complete = !bufferAbrupt && !bufferFailed && !incompleteEdit && (sawDone || sawFinish);
           if (complete) {
             ensureStreamHeaders({}, retryCount);
             stopEarlyHeaderTimer();
@@ -1578,7 +1606,8 @@ async function startServer(upstreamBase, port, mode) {
                   const pathIdx = p ? text.indexOf(p) : -1;
                   let idx = Math.min(firstTag, pathIdx < 0 ? Infinity : pathIdx);
                   if (!Number.isFinite(idx)) idx = text.length;
-                  const narration = text.slice(0, idx).trimEnd();
+                  let narration = text.slice(0, idx).trimEnd();
+                  if (/^(edit|write|read|grep)$/i.test(narration)) narration = "";
                   const rebuilt = [];
                   if (narration) rebuilt.push(`data: ${JSON.stringify({ choices: [{ delta: { content: narration } }] })}\n\n`);
                   rebuilt.push(`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: `call_dsml_${++dsmlCallSeq}`, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } }] } }] })}\n\n`);
