@@ -459,6 +459,15 @@ const scenarios = {
       "[DONE]",
     ]);
   },
+  // Z13: DSML edit with path + oldString + newString -> real edit tool call.
+  "t-dsml-edit-toolcall": (req, res) => {
+    const dsml = 'edit C:\\Users\\User\\Desktop\\EXPERIMENTS\\DISCORD\\CHATBOT\\src\\modules\\status-card\\index.ts</ | DSML | parameter > < | DSML | parameter name="oldString" string="true">const A = 1;</ | DSML | parameter > < | DSML | parameter name="newString" string="true">const A = 2;</ | DSML | parameter > </ | DSML | invoke>';
+    sse(res, [
+      `{"choices":[{"delta":{"content":${JSON.stringify(dsml)}}}]}`,
+      '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+      "[DONE]",
+    ]);
+  },
   // Z: role-only chunk committed, then a 503 before any visible content ->
   // the proxy must retry instead of ending an empty turn.
   "t-empty-503-retry": (req, res) => {
@@ -711,6 +720,13 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     const z12Finish = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
     check("Z12: bare-path DSML read converted", z12Tool && z12Finish && !z12Err && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-dsml-edit-toolcall", stream: true });
+    const z13Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    const z13Tool = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; const a = JSON.parse(tc?.function?.arguments || "{}"); return tc?.function?.name === "edit" && String(a.filePath).includes("status-card") && a.oldString === "const A = 1;" && a.newString === "const A = 2;"; } catch { return false; } });
+    const z13Finish = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
+    check("Z13: DSML edit converted to tool call", z13Tool && z13Finish && !z13Err && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
     // N: text model + image -> vision model captions it, text model gets text only
     const imgBody = {
       model: "vision-text",
@@ -780,6 +796,11 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     r = await readSSE("/v1/chat/completions", { model: "t-dsml-bare-read", stream: true }, BUFFER_PORT);
     const bufBare = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; return tc?.function?.name === "read"; } catch { return false; } });
     check("BUF: bare-path DSML read converted", bufBare && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-dsml-edit-toolcall", stream: true }, BUFFER_PORT);
+    const bufEdit = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; const a = JSON.parse(tc?.function?.arguments || "{}"); return tc?.function?.name === "edit" && a.oldString === "const A = 1;" && a.newString === "const A = 2;"; } catch { return false; } });
+    check("BUF: DSML edit converted to tool call", bufEdit && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     bufferProxy.kill();
   } catch (e) {

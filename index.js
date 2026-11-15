@@ -103,6 +103,8 @@
 // rev: 2.15 — DSML read variants: accept the bare path before the parameter
 //      tags; buffer mode refuses to flush [DONE] without finish_reason when
 //      the answer is incomplete.
+// rev: 2.16 — DSML edit conversion: path + oldString + newString -> real edit
+//      tool call; parameter values stop at closing DSML tags.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -234,7 +236,7 @@ function parseDsmlRead(text) {
   const t = String(text);
   if (!t.includes("< | DSML |") && !t.includes("</ | DSML |")) return null;
   const param = (name) => {
-    const re = new RegExp(`<\\s*\\|\\s*DSML\\s*\\|\\s*parameter\\s+name="${name}"\\s+string="(?:true|false)">([\\s\\S]*?)(?=<\\s*\\|\\s*DSML\\s*\\||$)`);
+    const re = new RegExp(`<\\s*\\|\\s*DSML\\s*\\|\\s*parameter\\s+name="${name}"\\s+string="(?:true|false)">([\\s\\S]*?)(?=<\\s*\\/?\\s*\\|\\s*DSML\\s*\\||$)`);
     const m = t.match(re);
     return m ? m[1].trim() : null;
   };
@@ -252,6 +254,29 @@ function parseDsmlRead(text) {
   const limit = Number(param("limit"));
   if (Number.isFinite(limit)) args.limit = limit;
   return { name: "read", arguments: args };
+}
+
+// Conservative DSML edit parser. Requires a path plus BOTH oldString and
+// newString, so a truncated block is never turned into a file write.
+function parseDsmlEdit(text) {
+  const t = String(text);
+  if (!t.includes("< | DSML |") && !t.includes("</ | DSML |")) return null;
+  const param = (name) => {
+    const re = new RegExp(`<\\s*\\|\\s*DSML\\s*\\|\\s*parameter\\s+name="${name}"\\s+string="(?:true|false)">([\\s\\S]*?)(?=<\\s*\\/?\\s*\\|\\s*DSML\\s*\\||$)`);
+    const m = t.match(re);
+    return m ? m[1].trim() : null;
+  };
+  let filePath = param("path");
+  if (!filePath) {
+    const bare = t.match(/(?:^|\n)\s*edit\s+([A-Za-z]:\\[^\n<]+?|\/[^\n<]+?)\s*<\s*\/\s*\|\s*DSML\s*\|\s*parameter\s*>/i)
+      || t.match(/(?:^|\n)\s*edit\s+([A-Za-z]:\\[^\n<]+?|\/[^\n<]+?)\s*(?=<\s*\|\s*DSML\s*\|)/i);
+    if (bare) filePath = bare[1].trim();
+  }
+  if (!filePath) return null;
+  const oldString = param("oldString");
+  const newString = param("newString");
+  if (!oldString || !newString) return null;
+  return { name: "edit", arguments: { filePath, oldString, newString } };
 }
 
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -1156,6 +1181,28 @@ async function startServer(upstreamBase, port, mode) {
             }
             try { res.write("data: [DONE]\n\n"); } catch {}
             sawDone = true;
+            return null;
+          }
+          // Convert a text DSML edit block into a real edit tool call.
+          const dsmlEdit = parseDsmlEdit(contentDelta(data));
+          if (dsmlEdit) {
+            commitData();
+            const call = {
+              choices: [{
+                delta: {
+                  tool_calls: [{
+                    index: 0,
+                    id: `call_dsml_${++dsmlCallSeq}`,
+                    type: "function",
+                    function: { name: dsmlEdit.name, arguments: JSON.stringify(dsmlEdit.arguments) },
+                  }],
+                },
+              }],
+            };
+            try { res.write(`data: ${JSON.stringify(call)}\n\n`); } catch {}
+            sawToolCalls = true;
+            syntheticToolCall = true;
+            log(`converted DSML edit to tool_calls: ${dsmlEdit.arguments.filePath}`);
             return null;
           }
           // Convert a text DSML read block into a real read tool call.
