@@ -406,6 +406,24 @@ const scenarios = {
       ]);
     }
   },
+  // Z9: a text tool call ("edit C:\...") instead of structured tool_calls ->
+  // retry; the retry emits a real tool call, which the proxy hands off.
+  "t-text-toolcall-handoff": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify("edit C:\\Users\\User\\Desktop\\EXPERIMENTS\\DISCORD\\CHATBOT\\src\\modules\\status-card\\index.ts const status = liveness.online ? localize(locale, \"status_card.bot_online\") : localize(locale, \"status_card.bot_offline\");")}}}]}`,
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    } else {
+      sse(res, [
+        '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_edit","type":"function","function":{"name":"edit","arguments":"{\\"filePath\\":\\"src/modules/status-card/index.ts\\"}"}}]}}]}',
+        '{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+        "[DONE]",
+      ]);
+    }
+  },
   // Z: role-only chunk committed, then a 503 before any visible content ->
   // the proxy must retry instead of ending an empty turn.
   "t-empty-503-retry": (req, res) => {
@@ -635,6 +653,13 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     r = await readSSE("/v1/chat/completions", { model: "t-plain-code-dump", stream: true });
     const z8Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
     check("Z8: large plain code dump continued", textOf(r.text) === PLAIN_CODE_FULL && !z8Err && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-text-toolcall-handoff", stream: true });
+    const z9Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    const z9Tool = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.choices?.[0]?.delta?.tool_calls; } catch { return false; } });
+    const z9Finish = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
+    check("Z9: text tool call retried and handed off", z9Tool && z9Finish && !z9Err && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     // N: text model + image -> vision model captions it, text model gets text only
     const imgBody = {

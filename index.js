@@ -92,6 +92,9 @@
 //      no longer blocks the dump retry; finish diagnostics log toolCalls.
 // rev: 2.11 — broad code-dump fallback: any large code-like output (braces/
 //      semicolons) is treated as a possible cut, not only path/DSML-marked.
+// rev: 2.12 — text tool calls: retry when content contains "edit/write/read/
+//      shell <path>" or DSML instead of structured tool_calls; hand off the
+//      retry's real tool call.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -198,6 +201,17 @@ function looksLikePartialCode(text) {
   // Fallback: any large code-like output (braces/semicolons) that stopped.
   // The no-progress guard limits this to one extra retry.
   return /[{};]/.test(t);
+}
+
+// The model sometimes writes a tool call as text ("edit C:\...", "write ...",
+// DSML blocks) instead of a structured tool_calls delta. Retry so it can emit
+// a real tool call; the continuation handoff then forwards it.
+function looksLikeTextToolCall(text) {
+  const t = String(text);
+  return /(^|\n)\s*(edit|write|read|shell|bash|apply_patch|patch)\s+[A-Za-z]:\\/i.test(t)
+    || /(^|\n)\s*(edit|write|read|shell|bash|apply_patch|patch)\s+\/[^\n]+/i.test(t)
+    || t.includes("< | DSML |")
+    || t.includes("</ | DSML |");
 }
 
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -1097,11 +1111,12 @@ async function startServer(upstreamBase, port, mode) {
             const finishContent = contentDelta(data);
             const combined = sentContent + finishContent;
             const codeDump = looksLikePartialCode(combined);
-            // A DSML edit block streamed as content can finish with
+            const textTool = looksLikeTextToolCall(combined);
+            // A DSML/text tool call streamed as content can finish with
             // tool_calls even though no structured tool call was sent. Treat
             // it like a code dump: retry, then hand off any real tool call.
-            const abrupt = (finishReason === "stop" || finishReason === "length" || (finishReason === "tool_calls" && codeDump))
-              && (looksIncomplete(combined) || codeDump);
+            const abrupt = (finishReason === "stop" || finishReason === "length" || finishReason === "tool_calls")
+              && (looksIncomplete(combined) || codeDump || textTool);
             // A prior Read/tool call in the same turn must not block a code
             // dump continuation; the retry may reproduce the text or hand off
             // a new tool call.
