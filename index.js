@@ -80,6 +80,8 @@
 // rev: 2.6 — empty-turn recovery: a role-only chunk can commit headers before
 //      a 503, leaving zero visible content. The proxy now retries that case
 //      instead of closing an empty turn.
+// rev: 2.7 — punctuation coverage: a stop after a Unicode dash (—, –, ―, −)
+//      is treated as mid-thought, like an ASCII hyphen; opening brackets too.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -168,8 +170,11 @@ function looksIncomplete(text) {
   if (((t.match(/```/g) || []).length % 2) === 1) return true; // unclosed code fence
   const last = t[t.length - 1];
   if (/[.!?…"'”’)\]}»]/.test(last)) return false;
+  if (/[(\[{]/.test(last)) return true;
   if (last === ":") return true;
-  return /[A-Za-z0-9,;:_`-]/.test(last);
+  // Include Unicode dashes (em/en/horizontal bar/minus): a model that stops
+  // right after "—" is mid-thought, not done.
+  return /[A-Za-z0-9,;:_`\-\u2010-\u2015\u2212]/.test(last);
 }
 
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));

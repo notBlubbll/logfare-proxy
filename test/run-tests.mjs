@@ -18,6 +18,8 @@ let hitCount = 0;
 
 const ABRUPT_PREFIX = "Let me keep it simple and honest: the locale file blurbs are authored from the actual persona prompts, which I just";
 const ABRUPT_FULL = ABRUPT_PREFIX + " realized should live in the persona's own data and completed cleanly.";
+const DASH_PREFIX = "Internal #bot-status: 3 individual per-bot cards with everything per-bot (description, Age, Awake, Replies, Avg response, Tokens, In/out) —";
+const DASH_FULL = DASH_PREFIX + " plus the remaining per-bot metrics and the final card layout.";
 const COMPLETE_TEXT = "This answer is already complete and ends with a period, so it must not be continued by the proxy.";
 
 function sse(res, events, opts = {}) {
@@ -274,6 +276,23 @@ const scenarios = {
       "[DONE]",
     ]);
   },
+  // Z2: a stop right after an em dash is mid-thought -> continue.
+  "t-abrupt-dash-continue": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify(DASH_PREFIX)}}}]}`,
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    } else {
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify(DASH_FULL)}}}]}`,
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    }
+  },
   // Z: role-only chunk committed, then a 503 before any visible content ->
   // the proxy must retry instead of ending an empty turn.
   "t-empty-503-retry": (req, res) => {
@@ -465,6 +484,11 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     r = await readSSE("/v1/chat/completions", { model: "t-empty-503-retry", stream: true });
     const zErr = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
     check("Z: empty 503 after role chunk retried", textOf(r.text) === "recovered-after-empty-503" && hits.length - hitsBeforeZ === 2 && !zErr && r.text.includes("[DONE]"), `hits=${hits.length - hitsBeforeZ} text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-abrupt-dash-continue", stream: true });
+    const z2Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    check("Z2: stop after em dash continued", textOf(r.text) === DASH_FULL && !z2Err && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     // N: text model + image -> vision model captions it, text model gets text only
     const imgBody = {
