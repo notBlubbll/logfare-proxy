@@ -164,12 +164,11 @@ const scenarios = {
       sse(res, ['{"choices":[{"delta":{"content":"rl-ok"}}]}', "[DONE]"]);
     }
   },
-  // P: "Service temporarily unavailable" is transient -> patient retry, does
-  // NOT consume the 10 hard retries (12 retries then success would give up
-  // under the old hard-failure accounting).
+  // P: "Service temporarily unavailable" is transient -> patient retry within
+  // the hard cap (5 failures, then success).
   "t-transient-patient": (req, res) => {
     const n = hitCount;
-    if (n <= 12) {
+    if (n <= 5) {
       sse(res, ['{"error":{"message":"Service temporarily unavailable","type":"server_error"}}']);
     } else {
       sse(res, ['{"choices":[{"delta":{"content":"transient-ok"}}]}', "[DONE]"]);
@@ -602,6 +601,17 @@ const scenarios = {
     events.push("[DONE]");
     sse(res, events);
   },
+  // Z28: always a cut partial answer -> give-up must append a visible warning,
+  // never a silent close (and never the buffered partial text).
+  "t-giveup-partial": (req, res) => {
+    sse(res, ['{"choices":[{"delta":{"content":"partial"}}]}', "CLOSE"]);
+  },
+  // Z29: always a transient 503 -> give-up must warn, not close silently and
+  // not forward the raw upstream error.
+  "t-giveup-transient": (req, res) => {
+    res.writeHead(503, { "content-type": "application/json" });
+    res.end('{"error":{"message":"Service temporarily unavailable","type":"server_error"}}');
+  },
   // Z24: unparseable DSML shape -> retry instead of showing raw DSML.
   "t-dsml-garbage-retry": (req, res) => {
     const n = hitCount;
@@ -786,7 +796,7 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
 
     hitCount = 0;
     r = await readSSE("/v1/chat/completions", { model: "t-transient-patient", stream: true });
-    check("P: 'Service temporarily unavailable' patient (13 attempts, no give-up)", r.retries === "12" && textOf(r.text) === "transient-ok", `retries=${r.retries} text=${textOf(r.text)}`);
+    check("P: 'Service temporarily unavailable' patient (5 retries, then ok)", r.retries === "5" && textOf(r.text) === "transient-ok", `retries=${r.retries} text=${textOf(r.text)}`);
 
     hitCount = 0;
     r = await readSSE("/v1/chat/completions", { model: "t-finish-no-done", stream: true });
@@ -1066,6 +1076,14 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     r = await readSSE("/v1/chat/completions", { model: "t-tiny-chunk-edit", stream: true }, BUFFER_PORT);
     const tinyEdit = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; const a = JSON.parse(tc?.function?.arguments || "{}"); return tc?.function?.name === "edit" && String(a.newString).includes("The header names the state only"); } catch { return false; } });
     check("Z27: tiny-chunk edit converted without retry", hitCount === 1 && tinyEdit && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `hits=${hitCount} text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-giveup-partial", stream: true }, BUFFER_PORT);
+    check("Z28: partial give-up appends a visible warning", textOf(r.text).includes("logfare-proxy: giving up") && textOf(r.text).includes("incomplete") && !textOf(r.text).includes("partial") && r.text.includes('"finish_reason":"stop"') && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-giveup-transient", stream: true }, BUFFER_PORT);
+    check("Z29: transient give-up warns, raw error never forwarded", textOf(r.text).includes("logfare-proxy: giving up") && textOf(r.text).includes("temporarily unavailable") && !r.text.includes("server_error") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     hitCount = 0;
     r = await readSSE("/v1/chat/completions", { model: "t-dsml-garbage-retry", stream: true }, BUFFER_PORT);

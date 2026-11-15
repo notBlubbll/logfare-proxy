@@ -129,6 +129,9 @@
 //      raw-SSE scan guarantees unconvertible DSML is retried, never forwarded.
 //      /status groups streams by x-opencode-session-id so the pill shows
 //      `failed: N` for its own session only.
+// rev: 2.26 — never-forward transients (503) now obey the 10-retry hard cap,
+//      and every give-up appends a visible warning instead of closing
+//      silently; a discarded buffered attempt still counts as partial.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -1087,6 +1090,10 @@ async function startServer(upstreamBase, port, mode) {
 
     const rlDeadline = Date.now() + RL_BUDGET_MS;
     let hardFailures = 0;
+    // Never-forward transients (503 "Service temporarily unavailable") are
+    // retried patiently, but they still have a hard cap: an outage must end
+    // with a visible warning, not an endless "Working" spinner.
+    let neverForwardFailures = 0;
     let rlStreak = 0;
     let attemptsUsed = 0;
     // Post-commit continuation: when the upstream cuts a stream mid-answer
@@ -1096,6 +1103,9 @@ async function startServer(upstreamBase, port, mode) {
     // duplicating or retracting content. If the retry diverges, we end with
     // the partial answer instead of showing an error/retry loop.
     let sentContent = "";
+    // Buffer mode: the last failed attempt had text before it was discarded.
+    // Give-up still needs to warn the user that the answer is incomplete.
+    let giveUpHadContent = false;
     let continuationPrefix = null;
     let continuationAttempts = 0;
     const MAX_CONTINUATION = 3;
@@ -1145,7 +1155,10 @@ async function startServer(upstreamBase, port, mode) {
             // success or client disconnect so the client never sees them.
             const neverForward = NEVER_FORWARD_RE.test(text);
             const wait = parseRetryAfterMs(up.headers["retry-after"]) || rateLimitBackoffMs(rlStreak++);
-            if (!neverForward && Date.now() + wait >= rlDeadline) { log(`attempt ${attempt}: ${lastFailure} — patient budget exhausted`); break; }
+            if (neverForward) {
+              neverForwardFailures++;
+              if (neverForwardFailures > MAX_RETRIES) { log(`attempt ${attempt}: ${lastFailure} — never-forward retries exhausted`); break; }
+            } else if (Date.now() + wait >= rlDeadline) { log(`attempt ${attempt}: ${lastFailure} — patient budget exhausted`); break; }
             log(`attempt ${attempt}: ${lastFailure} — ${neverForward ? "never-forward transient" : "transient/rate-limited"}, retrying in ${Math.round(wait / 1000)}s`);
             await retryPause(wait);
             continue;
@@ -1799,8 +1812,9 @@ async function startServer(upstreamBase, port, mode) {
           // Nothing was sent to the client in buffer mode, so the failed
           // attempt's text must not feed the next attempt's completeness
           // checks (it made every retry look like a cut answer).
+          if (sentContent.length > 0) giveUpHadContent = true;
           sentContent = "";
-          try { up.destroy(); } catch {};
+          try { up.destroy(); } catch {}
           hardFailures++;
           if (hardFailures > MAX_RETRIES) break;
           await retryPause(backoffMs(retryCount));
@@ -1882,9 +1896,12 @@ async function startServer(upstreamBase, port, mode) {
         log(`attempt ${attempt}: pre-commit failure: ${lastFailure}`);
         if (bailed && bailedRLFlag) {
           // rate-limited / transient in-stream: patient retry. NEVER_FORWARD
-          // classes have no budget (retry until success or client disconnect).
+          // classes ignore the time budget but still obey the hard retry cap.
           const wait = rateLimitBackoffMs(rlStreak++);
-          if (!bailedNeverForward && Date.now() + wait >= rlDeadline) { log(`rate-limit budget exhausted`); break; }
+          if (bailedNeverForward) {
+            neverForwardFailures++;
+            if (neverForwardFailures > MAX_RETRIES) { log(`never-forward retries exhausted`); break; }
+          } else if (Date.now() + wait >= rlDeadline) { log(`rate-limit budget exhausted`); break; }
           log(`retrying in ${Math.round(wait / 1000)}s (${bailedNeverForward ? "never-forward transient" : "rate limit"})`);
           await retryPause(wait);
           continue;
@@ -1906,34 +1923,49 @@ async function startServer(upstreamBase, port, mode) {
     // give-up path (only after MAX_RETRIES): surface the last failure
     if (BUFFER_UNTIL_COMPLETE) { try { res.write = rawWrite; } catch {} }
     log(`req ${pathAndQuery}: GIVING UP (attempts=${attemptsUsed}, hardFailures=${hardFailures}): ${lastFailure}`);
-    // If content was already streamed, never surface a late error (it would
-    // make the desktop retry the whole turn). Close the partial answer cleanly.
-    if (dataCommitted && sentContent.length > 0) {
-      log(`req ${pathAndQuery}: give-up after partial content (${sentContent.length} chars); ending partial stream`);
+    // A visible, proxy-authored warning. Never dump the raw upstream error
+    // (the desktop would show it as a broken stream and retry the turn), and
+    // never close silently: the user must see that the answer is incomplete.
+    const giveUpNotice = () => {
+      const raw = String(lastFailure || "");
+      const transient = NEVER_FORWARD_RE.test(raw) || (lastStatusBody && NEVER_FORWARD_RE.test(lastStatusBody));
+      const reason = transient
+        ? "the upstream was temporarily unavailable"
+        : lastStatus && lastStatus >= 400
+          ? `the upstream returned status ${lastStatus}`
+          : "the upstream stream ended before the answer completed";
+      const retries = Math.max(1, attemptsUsed - 1);
+      return `⚠️ logfare-proxy: giving up after ${retries} retries — ${reason}. The answer is incomplete; please try again.`;
+    };
+    const emitGiveUpNotice = () => {
+      const notice = giveUpNotice();
       ensureStreamHeaders({}, attemptsUsed - 1);
       try {
+        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: notice } }] })}\n\n`);
         res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
         res.write("data: [DONE]\n\n");
       } catch {}
       endStream();
+    };
+    // If content was already streamed, never surface a late error (it would
+    // make the desktop retry the whole turn), but append the warning so the
+    // cut answer is not mistaken for a complete one.
+    if (dataCommitted && (sentContent.length > 0 || giveUpHadContent)) {
+      log(`req ${pathAndQuery}: give-up after partial content (${sentContent.length} chars, had=${giveUpHadContent}); appending warning`);
+      emitGiveUpNotice();
       return;
     }
     // Safety net: never forward a NEVER_FORWARD error (e.g. "Service
-    // temporarily unavailable"). Close cleanly so the desktop does not start
-    // its "Attempt N - retrying" turn loop.
+    // temporarily unavailable"). Emit the warning as normal assistant content
+    // so the desktop does not start its "Attempt N - retrying" turn loop.
     if (NEVER_FORWARD_RE.test(lastFailure) || (lastStatusBody && NEVER_FORWARD_RE.test(lastStatusBody))) {
       log(`req ${pathAndQuery}: give-up suppressed (never-forward): ${snippet(lastFailure)}`);
       if (wantsStream || res.headersSent) {
-        ensureStreamHeaders({}, attemptsUsed - 1);
-        try {
-          res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
-          res.write("data: [DONE]\n\n");
-        } catch {}
-        endStream();
+        emitGiveUpNotice();
       } else {
         try {
           res.writeHead(200, { "content-type": "application/json" });
-          res.end('{"id":"proxy","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{}}');
+          res.end(JSON.stringify({ id: "proxy", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: giveUpNotice() }, finish_reason: "stop" }], usage: {} }));
         } catch {}
       }
       return;

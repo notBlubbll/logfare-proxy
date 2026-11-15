@@ -126,12 +126,15 @@ proceeds.
 |---|---|---|
 | `429`, Serverless token-per-minute limit (status or in-band) | patient | retry until it works: 5/7/10/15/20/30s ladder, `Retry-After` honored (cap 60s), 25-min budget |
 | `AiError 8006` body-size, `413` | patient | same-body retry until it works (flaky per attempt) |
+| `503 Service temporarily unavailable` (status or in-band) | never-forward | patient backoff, hard-capped at 10 retries |
 | other 5xx, network death pre-commit, invalid event pre-commit | hard | 10 retries, then give up |
 | invalid event post-commit | — | dropped inline |
 | upstream death post-commit | — | healed with valid error chunk + `[DONE]` |
-| give-up | — | forwards the last status, or the real upstream error as a valid SSE event |
+| give-up | — | forwards the last status, the real upstream error as a valid SSE event, or a visible `⚠️ logfare-proxy: giving up after N retries …` warning when the answer was already partial |
 
-Patient retries never consume the 10 hard retries.
+Patient retries never consume the 10 hard retries, but never-forward
+transients have their own hard cap of 10 so an outage always ends with a
+visible warning instead of an endless spinner.
 
 ## Standalone
 
@@ -175,7 +178,7 @@ Per-request overrides (stripped before forwarding): `x-lf-upstream`,
 bun test/run-tests.mjs
 ```
 
-Spins a mock upstream plus the proxy and asserts 65 scenarios: pre-commit
+Spins a mock upstream plus the proxy and asserts 67 scenarios: pre-commit
 retry, post-commit drop, in-band error retry, give-up after exactly 10 retries,
 null-field repair, mid-stream healing, non-stream passthrough, bulk-JSON
 conversion, stall retry, 200+8006 same-body retry, budget exhaustion surfacing
@@ -204,8 +207,9 @@ streaming scenarios with buffer mode off and the buffer-mode scenarios (cut
 retried transparently, DSML read, bare-path DSML read, DSML edit, DSML grep,
 DSML write, DSML shell, bare image read, tool-call-after-finish, split DSML,
 tiny-chunk DSML edit, incomplete edit retry, truncated edit retry,
-unparseable DSML retry, bare-path code dump retry, fenced-code answer, abrupt
-stop, and `[DONE]` without finish_reason).
+unparseable DSML retry, bare-path code dump retry, fenced-code answer,
+partial give-up warning, transient give-up warning, abrupt stop, and `[DONE]`
+without finish_reason).
 
 ## Desktop working timer (optional)
 
