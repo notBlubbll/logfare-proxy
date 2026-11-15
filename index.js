@@ -97,6 +97,9 @@
 //      retry's real tool call.
 // rev: 2.13 — DSML read conversion: a DSML read block streamed as text is
 //      converted to a real read tool_calls delta; finish stop -> tool_calls.
+// rev: 2.14 — buffer-until-complete (default): SSE responses are buffered and
+//      flushed only after a complete turn; failures retry transparently with
+//      no partial output. LOGFARE_PROXY_BUFFER=0 restores streaming.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -174,6 +177,9 @@ const IDLE_MS = 300000; // max gap between SSE events
 const ATTEMPT_TIMEOUT_MS = 1800000; // per attempt, mirrors provider timeout
 const KEEPALIVE_MS = 15000; // SSE comment keepalive while headers sent but no data committed
 const EARLY_HEADER_MS = 20000; // send SSE headers+keepalives if no data committed within this window (prevents client header timeout)
+// Buffer the whole SSE response and flush only when it completes. Transparent
+// retries, no partial/cut output. Set LOGFARE_PROXY_BUFFER=0 for streaming.
+const BUFFER_UNTIL_COMPLETE = !/^(0|false|off)$/i.test(process.env.LOGFARE_PROXY_BUFFER || "1");
 const LOG_MAX_BYTES = 2 * 1024 * 1024;
 
 // A "stop" that ends mid-sentence is treated as a cut, not a completed turn.
@@ -706,6 +712,7 @@ async function startServer(upstreamBase, port, mode) {
 
     let clientGone = false;
     res.on("close", () => { clientGone = true; });
+    const rawWrite = res.write.bind(res);
 
     // Header-timeout coverage: for streaming requests, if no real data is
     // committed within EARLY_HEADER_MS (vision handoff or pre-commit retries
@@ -723,7 +730,7 @@ async function startServer(upstreamBase, port, mode) {
     const stopEarlyHeaderTimer = () => { if (earlyHeaderTimer) { clearTimeout(earlyHeaderTimer); earlyHeaderTimer = null; } };
     const sendKeepalive = () => {
       if (clientGone || streamEnded || dataCommitted) { stopKeepalive(); return; }
-      try { res.write(": keepalive\n\n"); } catch {}
+      try { rawWrite(": keepalive\n\n"); } catch {}
     };
     const startEarlyStream = () => {
       if (!wantsStream || earlyStream || res.headersSent || dataCommitted) return;
@@ -976,12 +983,20 @@ async function startServer(upstreamBase, port, mode) {
         let dsmlCallSeq = 0;
         let forwardedChars = 0;
         let lastErr = null;
+        const buffered = [];
+        let bufferAbrupt = false;
+        let bufferFailed = false;
+        if (BUFFER_UNTIL_COMPLETE) res.write = (chunk) => { buffered.push(chunk); return true; };
         const commitData = () => {
           if (!dataCommitted) {
-            ensureStreamHeaders(up.headers, retryCount);
-            dataCommitted = true;
-            stopEarlyHeaderTimer();
-            stopKeepalive();
+            if (BUFFER_UNTIL_COMPLETE) {
+              dataCommitted = true;
+            } else {
+              ensureStreamHeaders(up.headers, retryCount);
+              dataCommitted = true;
+              stopEarlyHeaderTimer();
+              stopKeepalive();
+            }
           }
         };
         const ev = makeEventizer();
@@ -1106,6 +1121,10 @@ async function startServer(upstreamBase, port, mode) {
           // desktop retry the whole turn ("Attempt N - retrying"). Close the
           // stream cleanly instead.
           if (isErrorPayload(data) && dataCommitted && NEVER_FORWARD_RE.test(data)) {
+            if (BUFFER_UNTIL_COMPLETE && !sawFinish) {
+              bufferFailed = true;
+              return { bail: `buffered never-forward error`, rateLimited: false, neverForward: true, postCommit: true };
+            }
             // Headers may have been committed by early SSE/keepalives or a
             // role-only chunk, but no visible content was sent. Retrying is
             // safe and recovers empty 503 turns.
@@ -1170,6 +1189,10 @@ async function startServer(upstreamBase, port, mode) {
             // dump continuation; the retry may reproduce the text or hand off
             // a new tool call.
             const allowAfterToolCalls = codeDump && (finishReason === "stop" || finishReason === "length");
+            if (abrupt && BUFFER_UNTIL_COMPLETE && !sawToolCalls && !syntheticToolCall) {
+              bufferAbrupt = true;
+              return null;
+            }
             if (abrupt && (!sawToolCalls || allowAfterToolCalls) && sentContent.length > 0 && continuationAttempts < MAX_CONTINUATION
                 && (continuationPrefix === null || continuationEmitted > 0)) {
               continuationPrefix = sentContent;
@@ -1286,6 +1309,30 @@ async function startServer(upstreamBase, port, mode) {
           lastErr = streamErr;
           log(`attempt ${attempt}: stream error: ${streamErr?.message || streamErr}`);
         }
+        if (BUFFER_UNTIL_COMPLETE) {
+          try { res.write = rawWrite; } catch {}
+          if (lastErr === "client-gone") { buffered.length = 0; return; }
+          const complete = !bufferAbrupt && !bufferFailed && (sawDone || sawFinish);
+          if (complete) {
+            ensureStreamHeaders({}, retryCount);
+            stopEarlyHeaderTimer();
+            stopKeepalive();
+            if (!sawDone) buffered.push("data: [DONE]\n\n");
+            for (const chunk of buffered) { try { rawWrite(chunk); } catch {} }
+            endStream();
+            try { up.destroy(); } catch {}
+            log(`req ${pathAndQuery}: stream done (buffered) retries=${retryCount} chars=${sentContent.length} sawDone=${sawDone} sawFinish=${sawFinish} in ${Date.now() - started}ms`);
+            return;
+          }
+          if (!bailed) lastFailure = `buffered stream failed (sawDone=${sawDone} sawFinish=${sawFinish} err=${lastErr?.message || lastErr || "none"})`;
+          log(`req ${pathAndQuery}: buffered stream failed; retrying (${lastFailure})`);
+          buffered.length = 0;
+          try { up.destroy(); } catch {}
+          hardFailures++;
+          if (hardFailures > MAX_RETRIES) break;
+          await sleep(backoffMs(retryCount));
+          continue;
+        }
         if (continuationFailed) {
           // The retry diverged or ended before reaching the prefix. We cannot
           // safely splice it, so close the partial answer cleanly.
@@ -1384,6 +1431,7 @@ async function startServer(upstreamBase, port, mode) {
     }
 
     // give-up path (only after MAX_RETRIES): surface the last failure
+    if (BUFFER_UNTIL_COMPLETE) { try { res.write = rawWrite; } catch {} }
     log(`req ${pathAndQuery}: GIVING UP (attempts=${attemptsUsed}, hardFailures=${hardFailures}): ${lastFailure}`);
     // If content was already streamed, never surface a late error (it would
     // make the desktop retry the whole turn). Close the partial answer cleanly.

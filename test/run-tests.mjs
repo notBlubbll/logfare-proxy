@@ -471,8 +471,8 @@ const mock = createServer((req, res) => {
   });
 });
 
-async function readSSE(path, body) {
-  const r = await fetch(`http://127.0.0.1:${PROXY_PORT}${path}`, {
+async function readSSE(path, body, port = PROXY_PORT) {
+  const r = await fetch(`http://127.0.0.1:${port}${path}`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: "Bearer test-key" },
     body: JSON.stringify(body),
@@ -493,7 +493,7 @@ function check(name, cond, extra = "") {
 
 mock.listen(MOCK_PORT, "127.0.0.1", async () => {
   const proxy = spawn(RUNTIME, [PLUGIN], {
-    env: { ...process.env, LOGFARE_PROXY_PORT: String(PROXY_PORT), LOGFARE_PROXY_UPSTREAM: `http://127.0.0.1:${MOCK_PORT}/v1`, LOGFARE_PROXY_RL_BUDGET_MS: "9000", LOGFARE_PROXY_RL_BACKOFF_MS: "200,300,500", LOGFARE_PROXY_BACKOFF_MS: "10,20,30", LOGFARE_PROXY_VISION_TARGETS: "vision-text", LOGFARE_PROXY_VISION_MODEL: "vision-flash" },
+    env: { ...process.env, LOGFARE_PROXY_PORT: String(PROXY_PORT), LOGFARE_PROXY_UPSTREAM: `http://127.0.0.1:${MOCK_PORT}/v1`, LOGFARE_PROXY_BUFFER: "0", LOGFARE_PROXY_RL_BUDGET_MS: "9000", LOGFARE_PROXY_RL_BACKOFF_MS: "200,300,500", LOGFARE_PROXY_BACKOFF_MS: "10,20,30", LOGFARE_PROXY_VISION_TARGETS: "vision-text", LOGFARE_PROXY_VISION_MODEL: "vision-flash" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   proxy.stdout.on("data", (d) => process.stdout.write(`[proxy] ${d}`));
@@ -710,6 +710,36 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
       oHits.length === 1 && oHits[0] === "vision-text" && textOf(r.text).includes("desc=yes"),
       `hits=${JSON.stringify(oHits)} text=${textOf(r.text)}`
     );
+
+    // Buffer mode: same plugin with LOGFARE_PROXY_BUFFER=1.
+    const BUFFER_PORT = 17332;
+    const bufferProxy = spawn(RUNTIME, [PLUGIN], {
+      env: { ...process.env, LOGFARE_PROXY_PORT: String(BUFFER_PORT), LOGFARE_PROXY_UPSTREAM: `http://127.0.0.1:${MOCK_PORT}/v1`, LOGFARE_PROXY_BUFFER: "1", LOGFARE_PROXY_RL_BUDGET_MS: "9000", LOGFARE_PROXY_RL_BACKOFF_MS: "200,300,500", LOGFARE_PROXY_BACKOFF_MS: "10,20,30" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    bufferProxy.stdout.on("data", (d) => process.stdout.write(`[buf] ${d}`));
+    bufferProxy.stderr.on("data", (d) => process.stdout.write(`[buf!] ${d}`));
+    for (let i = 0; i < 50; i++) {
+      try { const h = await fetch(`http://127.0.0.1:${BUFFER_PORT}/healthz`); if (h.ok) break; } catch {}
+      await delay(200);
+    }
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-postcommit-continue", stream: true }, BUFFER_PORT);
+    const bufErr = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    check("BUF: cut retried transparently, full answer once", r.retries === "1" && textOf(r.text) === "Hello world!" && !bufErr && r.text.includes("[DONE]"), `retries=${r.retries} text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-dsml-read-toolcall", stream: true }, BUFFER_PORT);
+    const bufTool = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; return tc?.function?.name === "read"; } catch { return false; } });
+    const bufFinish = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
+    check("BUF: DSML read converted in buffer mode", bufTool && bufFinish && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-abrupt-stop-continue", stream: true }, BUFFER_PORT);
+    check("BUF: abrupt stop retried transparently", textOf(r.text) === ABRUPT_FULL && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    bufferProxy.kill();
   } catch (e) {
     fail++;
     console.log(`FAIL harness error: ${e?.stack || e}`);
