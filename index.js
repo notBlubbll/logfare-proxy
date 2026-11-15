@@ -105,6 +105,8 @@
 //      the answer is incomplete.
 // rev: 2.16 — DSML edit conversion: path + oldString + newString -> real edit
 //      tool call; parameter values stop at closing DSML tags.
+// rev: 2.17 — DSML grep conversion: pattern + path + include -> real grep
+//      tool call (checked before read).
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -227,6 +229,21 @@ function looksLikeTextToolCall(text) {
     || t.includes("</ | DSML |");
 }
 
+// A bare path followed by file content (no edit/write keyword, no DSML tags)
+// right after narration like "the edit didn't apply / let me add..." is a
+// malformed tool call, not an answer. Buffer mode retries it.
+function looksLikeBarePathEdit(text) {
+  const t = String(text);
+  if (t.length < 200) return false;
+  const m = t.match(/(?:^|\n)\s*([A-Za-z]:\\[^\n]*?\.(?:ts|tsx|js|jsx|py|cs|cpp|h|json|md))\b/);
+  if (!m) return false;
+  const before = t.slice(0, m.index);
+  const after = t.slice(m.index + m[0].length);
+  if (after.length < 80) return false;
+  if (!/\b(edit|write|add|apply|update|change)\b/i.test(before)) return false;
+  return /[=:;{}]/.test(after);
+}
+
 // Conservative DSML read parser: logfare/deepseek sometimes streams
 //   < | DSML | parameter name="limit" string="false">100
 //   < | DSML | parameter name="offset" string="false">140
@@ -247,6 +264,12 @@ function parseDsmlRead(text) {
     const bare = t.match(/(?:^|\n)\s*([A-Za-z]:\\[^\n<]+?|\/[^\n<]+?)\s*<\s*\/\s*\|\s*DSML\s*\|\s*parameter\s*>/);
     if (bare) filePath = bare[1].trim();
   }
+  if (!filePath && !param("oldString") && !param("newString")) {
+    // Malformed edit/read: bare path followed by file content instead of
+    // parameters. Treat it as a read of that path (never a write).
+    const first = t.match(/^\s*([A-Za-z]:\\[^\n]*?\.(?:ts|tsx|js|jsx|py|cs|cpp|h|json|md))\b/);
+    if (first) filePath = first[1];
+  }
   if (!filePath) return null;
   const args = { filePath };
   const offset = Number(param("offset"));
@@ -254,6 +277,25 @@ function parseDsmlRead(text) {
   const limit = Number(param("limit"));
   if (Number.isFinite(limit)) args.limit = limit;
   return { name: "read", arguments: args };
+}
+
+// Conservative DSML grep parser: a `pattern` parameter means grep, not read.
+function parseDsmlGrep(text) {
+  const t = String(text);
+  if (!t.includes("< | DSML |") && !t.includes("</ | DSML |")) return null;
+  const param = (name) => {
+    const re = new RegExp(`<\\s*\\|\\s*DSML\\s*\\|\\s*parameter\\s+name="${name}"\\s+string="(?:true|false)">([\\s\\S]*?)(?=<\\s*\\/?\\s*\\|\\s*DSML\\s*\\||$)`);
+    const m = t.match(re);
+    return m ? m[1].trim() : null;
+  };
+  const pattern = param("pattern");
+  if (!pattern) return null;
+  const args = { pattern };
+  const path = param("path");
+  if (path) args.path = path;
+  const include = param("include");
+  if (include) args.include = include;
+  return { name: "grep", arguments: args };
 }
 
 // Conservative DSML edit parser. Requires a path plus BOTH oldString and
@@ -1205,6 +1247,28 @@ async function startServer(upstreamBase, port, mode) {
             log(`converted DSML edit to tool_calls: ${dsmlEdit.arguments.filePath}`);
             return null;
           }
+          // Convert a text DSML grep block into a real grep tool call.
+          const dsmlGrep = parseDsmlGrep(contentDelta(data));
+          if (dsmlGrep) {
+            commitData();
+            const call = {
+              choices: [{
+                delta: {
+                  tool_calls: [{
+                    index: 0,
+                    id: `call_dsml_${++dsmlCallSeq}`,
+                    type: "function",
+                    function: { name: dsmlGrep.name, arguments: JSON.stringify(dsmlGrep.arguments) },
+                  }],
+                },
+              }],
+            };
+            try { res.write(`data: ${JSON.stringify(call)}\n\n`); } catch {}
+            sawToolCalls = true;
+            syntheticToolCall = true;
+            log(`converted DSML grep to tool_calls: ${dsmlGrep.arguments.pattern}`);
+            return null;
+          }
           // Convert a text DSML read block into a real read tool call.
           const dsmlRead = parseDsmlRead(contentDelta(data));
           if (dsmlRead) {
@@ -1239,8 +1303,9 @@ async function startServer(upstreamBase, port, mode) {
             // A DSML/text tool call streamed as content can finish with
             // tool_calls even though no structured tool call was sent. Treat
             // it like a code dump: retry, then hand off any real tool call.
+            const bareEdit = BUFFER_UNTIL_COMPLETE && looksLikeBarePathEdit(combined);
             const abrupt = (finishReason === "stop" || finishReason === "length" || finishReason === "tool_calls")
-              && (looksIncomplete(combined) || codeDump || textTool);
+              && (looksIncomplete(combined) || codeDump || textTool || bareEdit);
             // A prior Read/tool call in the same turn must not block a code
             // dump continuation; the retry may reproduce the text or hand off
             // a new tool call.
@@ -1292,7 +1357,7 @@ async function startServer(upstreamBase, port, mode) {
             // is present; retry the whole request instead.
             if (BUFFER_UNTIL_COMPLETE && !sawFinish && !sawToolCalls && !syntheticToolCall) {
               const combined = sentContent;
-              if (looksIncomplete(combined) || looksLikePartialCode(combined) || looksLikeTextToolCall(combined)) {
+              if (looksIncomplete(combined) || looksLikePartialCode(combined) || looksLikeTextToolCall(combined) || looksLikeBarePathEdit(combined)) {
                 bufferAbrupt = true;
                 return null;
               }

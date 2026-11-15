@@ -468,6 +468,44 @@ const scenarios = {
       "[DONE]",
     ]);
   },
+  // Z14: malformed DSML with a bare path followed by file content (no
+  // oldString/newString) -> treat as a safe read of that path.
+  "t-dsml-bare-read-content": (req, res) => {
+    const dsml = 'C:\\Users\\User\\Desktop\\EXPERIMENTS\\DISCORD\\CHATBOT\\src\\modules\\status-card\\index.ts if (config.botKey) { embeds.push(...botEmbeds(config.botKey, context)); } </ | DSML | parameter>';
+    sse(res, [
+      `{"choices":[{"delta":{"content":${JSON.stringify(dsml)}}}]}`,
+      '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+      "[DONE]",
+    ]);
+  },
+  // Z15: bare path + file content after "edit didn't apply / add..." is a
+  // malformed tool call; buffer mode must retry, not flush it as an answer.
+  "t-bare-path-edit": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      const bad = "The edit didn't apply. Let me add the keys now.\nC:\\Users\\User\\Desktop\\EXPERIMENTS\\DISCORD\\CHATBOT\\src\\locales\\en-US\\commands\\config-bots.ts enabled_description: Whether this bot connects to Discord at all., model_description: Model ID from the catalog. Leave blank to keep the current model., enabled_description: Image to use as this bot's avatar., name_description: Display name this bot shows in Discord. Leave blank to keep the current one., avatar_applied: Avatar updated., avatar_failed: Could not set the avatar. Discord rejects images that are too large or not square., name_applied: Display name updated., avatar_current: Avatar, avatar_none: not set, model_description: Model ID from the catalog. Leave blank to keep the current model.,";
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify(bad)}}}]}`,
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    } else {
+      sse(res, [
+        '{"choices":[{"delta":{"content":"The keys were added correctly."}}]}',
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    }
+  },
+  // Z16: DSML grep (pattern + path + include) -> real grep tool call.
+  "t-dsml-grep-toolcall": (req, res) => {
+    const dsml = '< | DSML | parameter name="include" string="true">*.ts < | DSML | parameter name="limit" string="false">20 < | DSML | parameter name="path" string="true">C:\\Users\\User\\Desktop\\EXPERIMENTS\\DISCORD\\CHATBOT\\src\\utils\\db\\repositories\\PersonaRepository.ts < | DSML | parameter name="pattern" string="true">async setAvatar|webhook_avatar_url';
+    sse(res, [
+      `{"choices":[{"delta":{"content":${JSON.stringify(dsml)}}}]}`,
+      '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+      "[DONE]",
+    ]);
+  },
   // Z: role-only chunk committed, then a 503 before any visible content ->
   // the proxy must retry instead of ending an empty turn.
   "t-empty-503-retry": (req, res) => {
@@ -727,6 +765,20 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     const z13Finish = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
     check("Z13: DSML edit converted to tool call", z13Tool && z13Finish && !z13Err && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-dsml-bare-read-content", stream: true });
+    const z14Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    const z14Tool = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; return tc?.function?.name === "read" && String(tc.function.arguments).includes("status-card"); } catch { return false; } });
+    const z14Finish = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
+    check("Z14: malformed DSML path+content treated as read", z14Tool && z14Finish && !z14Err && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-dsml-grep-toolcall", stream: true });
+    const z16Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    const z16Tool = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; const a = JSON.parse(tc?.function?.arguments || "{}"); return tc?.function?.name === "grep" && a.pattern === "async setAvatar|webhook_avatar_url" && String(a.path).includes("PersonaRepository.ts") && a.include === "*.ts"; } catch { return false; } });
+    const z16Finish = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
+    check("Z16: DSML grep converted to tool call", z16Tool && z16Finish && !z16Err && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
     // N: text model + image -> vision model captions it, text model gets text only
     const imgBody = {
       model: "vision-text",
@@ -801,6 +853,16 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     r = await readSSE("/v1/chat/completions", { model: "t-dsml-edit-toolcall", stream: true }, BUFFER_PORT);
     const bufEdit = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; const a = JSON.parse(tc?.function?.arguments || "{}"); return tc?.function?.name === "edit" && a.oldString === "const A = 1;" && a.newString === "const A = 2;"; } catch { return false; } });
     check("BUF: DSML edit converted to tool call", bufEdit && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-dsml-bare-read-content", stream: true }, BUFFER_PORT);
+    const bufBareContent = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; return tc?.function?.name === "read" && String(tc.function.arguments).includes("status-card"); } catch { return false; } });
+    check("BUF: malformed DSML path+content treated as read", bufBareContent && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-dsml-grep-toolcall", stream: true }, BUFFER_PORT);
+    const bufGrep = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; const a = JSON.parse(tc?.function?.arguments || "{}"); return tc?.function?.name === "grep" && a.pattern === "async setAvatar|webhook_avatar_url" && String(a.path).includes("PersonaRepository.ts"); } catch { return false; } });
+    check("BUF: DSML grep converted to tool call", bufGrep && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     bufferProxy.kill();
   } catch (e) {
