@@ -84,6 +84,10 @@
 //      is treated as mid-thought, like an ASCII hyphen; opening brackets too.
 // rev: 2.8 — finish-chunk content: the terminal chunk can carry new text
 //      together with finish_reason; include it in the incompleteness check.
+// rev: 2.9 — tool-call handoff during continuation + code-dump detection: if a
+//      continuation retry chooses a tool call, hand it to the client instead
+//      of ending partial; large file/code dumps ending at "}" are treated as
+//      cuts (one retry, no-progress guard stops repeats).
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -177,6 +181,16 @@ function looksIncomplete(text) {
   // Include Unicode dashes (em/en/horizontal bar/minus): a model that stops
   // right after "—" is mid-thought, not done.
   return /[A-Za-z0-9,;:_`\-\u2010-\u2015\u2212]/.test(last);
+}
+
+// A large code/file dump that stops at a closing brace can still be a partial
+// file. Treat it as a cut (one retry; no-progress guard stops repeats).
+function looksLikePartialCode(text) {
+  const t = String(text);
+  if (t.length < 1500) return false;
+  const hasFile = /(^|\n)[A-Za-z]:\\[^\n]+\.(?:ts|tsx|js|jsx|py|cs|cpp|h|json|md)\b/.test(t)
+    || /(^|\n)\/[^\n]+\.(?:ts|tsx|js|jsx|py|cs|cpp|h|json|md)\b/.test(t);
+  return hasFile || t.includes("< | DSML |") || t.includes("</ | DSML |");
 }
 
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -978,8 +992,24 @@ async function startServer(upstreamBase, port, mode) {
           // dropped (the client already has them).
           if (!continuationMatched) {
             if (data.includes('"tool_calls"')) {
-              continuationFailed = true;
-              return { bail: `continuation saw tool_calls`, continuationFailed: true };
+              if (verdict.kind === "invalid") {
+                continuationFailed = true;
+                return { bail: `continuation saw invalid tool_calls`, continuationFailed: true };
+              }
+              // The retry chose a tool call instead of regenerating text.
+              // Hand it to the client (drop buffered duplicate content) so the
+              // turn can continue instead of ending partial.
+              continuationMatched = true;
+              sawToolCalls = true;
+              const tr = finishReasonOf(data);
+              if (tr !== null) {
+                sawFinish = true;
+                log(`finish_reason=${tr} chars=${sentContent.length}`);
+              }
+              commitData();
+              try { res.write(raw + "\n\n"); } catch {}
+              log(`continuation handed off tool_calls after ${sentContent.length} chars`);
+              return null;
             }
             const c = contentDelta(data);
             if (c) continuationBuffer += c;
@@ -1059,7 +1089,8 @@ async function startServer(upstreamBase, port, mode) {
             // regenerates it and the suffix starts with it (it was not sent).
             const finishContent = contentDelta(data);
             const combined = sentContent + finishContent;
-            const abrupt = (finishReason === "stop" || finishReason === "length") && looksIncomplete(combined);
+            const abrupt = (finishReason === "stop" || finishReason === "length")
+              && (looksIncomplete(combined) || looksLikePartialCode(combined));
             if (abrupt && !sawToolCalls && sentContent.length > 0 && continuationAttempts < MAX_CONTINUATION
                 && (continuationPrefix === null || continuationEmitted > 0)) {
               continuationPrefix = sentContent;

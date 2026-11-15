@@ -24,6 +24,8 @@ const COMPLETE_TEXT = "This answer is already complete and ends with a period, s
 const FINISH_PREFIX = "interface StatusCardRow { showProviderUsage: boolean; showProfile: boolean; showTokens: boolean; showTimings: boolean; showAvgResponse: boolean; showMeasuredLine: boolean; showAggregateModel: boolean; }\n\n";
 const FINISH_TAIL = "interface StatusCardRow {";
 const FINISH_FULL = FINISH_PREFIX + "interface StatusCardRow {\n  id: string;\n  showProviderUsage: boolean;\n}";
+const CODE_PREFIX = "C:\\Users\\User\\Desktop\\EXPERIMENTS\\DISCORD\\CHATBOT\\src\\modules\\status-card\\index.ts\n" + "const value = 1;\n".repeat(100) + "}); }";
+const CODE_FULL = CODE_PREFIX + "\n// continued\nconst more = 2;";
 
 function sse(res, events, opts = {}) {
   res.writeHead(200, { "content-type": "text/event-stream", ...opts.headers });
@@ -314,6 +316,40 @@ const scenarios = {
       ]);
     }
   },
+  // Z4: the continuation retry emits a tool call before reproducing the text.
+  // The proxy must hand the tool call to the client instead of ending partial.
+  "t-continuation-toolcall": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      sse(res, [
+        '{"choices":[{"delta":{"content":"I will update the file now: "}}]}',
+        '{"error":{"message":"Service temporarily unavailable","type":"server_error"}}',
+      ]);
+    } else {
+      sse(res, [
+        '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"edit","arguments":"{}"}}]}}]}',
+        '{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+        "[DONE]",
+      ]);
+    }
+  },
+  // Z5: a large file/code dump ending with "}" is treated as a cut.
+  "t-code-dump-continue": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify(CODE_PREFIX)}}}]}`,
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    } else {
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify(CODE_FULL)}}}]}`,
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    }
+  },
   // Z: role-only chunk committed, then a 503 before any visible content ->
   // the proxy must retry instead of ending an empty turn.
   "t-empty-503-retry": (req, res) => {
@@ -515,6 +551,18 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     r = await readSSE("/v1/chat/completions", { model: "t-abrupt-finish-content", stream: true });
     const z3Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
     check("Z3: finish-chunk content included in incomplete check", textOf(r.text) === FINISH_FULL && !z3Err && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-continuation-toolcall", stream: true });
+    const z4Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    const z4Tool = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.choices?.[0]?.delta?.tool_calls; } catch { return false; } });
+    const z4Finish = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
+    check("Z4: continuation hands tool calls to the client", textOf(r.text) === "I will update the file now: " && z4Tool && z4Finish && !z4Err && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-code-dump-continue", stream: true });
+    const z5Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    check("Z5: large code dump continued", textOf(r.text) === CODE_FULL && !z5Err && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     // N: text model + image -> vision model captions it, text model gets text only
     const imgBody = {
