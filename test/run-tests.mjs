@@ -516,6 +516,25 @@ const scenarios = {
       "[DONE]",
     ]);
   },
+  // Z18: bare image path after "let me look/upload" -> real read tool call.
+  "t-bare-image-read": (req, res) => {
+    const text = "All three generated. Let me look at them before uploading anything.\nC:\\Users\\User\\Desktop\\EXPERIMENTS\\DISCORD\\CHATBOT\\.tmp\\avatars\\pino.jpg";
+    sse(res, [
+      `{"choices":[{"delta":{"content":${JSON.stringify(text)}}}]}`,
+      '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+      "[DONE]",
+    ]);
+  },
+  // Z19: tool call content arrives AFTER finish_reason=stop -> buffer mode
+  // removes the early stop and emits a tool_calls finish.
+  "t-bare-image-after-finish": (req, res) => {
+    sse(res, [
+      '{"choices":[{"delta":{"content":"Pino reads well. Let me check the other two."}}]}',
+      '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+      '{"choices":[{"delta":{"content":"C:\\\\Users\\\\User\\\\Desktop\\\\EXPERIMENTS\\\\DISCORD\\\\CHATBOT\\\\.tmp\\\\avatars\\\\warden.jpg"}}]}',
+      "[DONE]",
+    ]);
+  },
   // Z: role-only chunk committed, then a 503 before any visible content ->
   // the proxy must retry instead of ending an empty turn.
   "t-empty-503-retry": (req, res) => {
@@ -796,6 +815,13 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     const z17Finish = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
     check("Z17: DSML write converted to tool call", z17Tool && z17Finish && !z17Err && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-bare-image-read", stream: true });
+    const z18Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    const z18Tool = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; return tc?.function?.name === "read" && String(tc.function.arguments).includes("pino.jpg"); } catch { return false; } });
+    const z18Finish = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
+    check("Z18: bare image path converted to read", z18Tool && z18Finish && !z18Err && !textOf(r.text).includes("pino.jpg") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
     // N: text model + image -> vision model captions it, text model gets text only
     const imgBody = {
       model: "vision-text",
@@ -885,6 +911,17 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     r = await readSSE("/v1/chat/completions", { model: "t-dsml-write-toolcall", stream: true }, BUFFER_PORT);
     const bufWrite = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; const a = JSON.parse(tc?.function?.arguments || "{}"); return tc?.function?.name === "write" && String(a.filePath).includes("145_bot_identity_avatar.sql") && String(a.content).includes("ALTER TABLE bot_identities"); } catch { return false; } });
     check("BUF: DSML write converted to tool call", bufWrite && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-bare-image-read", stream: true }, BUFFER_PORT);
+    const bufImage = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; return tc?.function?.name === "read" && String(tc.function.arguments).includes("pino.jpg"); } catch { return false; } });
+    check("BUF: bare image path converted to read", bufImage && !textOf(r.text).includes("pino.jpg") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-bare-image-after-finish", stream: true }, BUFFER_PORT);
+    const bufImageAfter = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; return tc?.function?.name === "read" && String(tc.function.arguments).includes("warden.jpg"); } catch { return false; } });
+    const bufImageAfterFin = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
+    check("BUF: tool call after finish gets tool_calls finish", bufImageAfter && bufImageAfterFin && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     bufferProxy.kill();
   } catch (e) {

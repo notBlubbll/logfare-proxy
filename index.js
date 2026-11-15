@@ -109,6 +109,8 @@
 //      tool call (checked before read).
 // rev: 2.18 — DSML write conversion: content + path -> real write tool call
 //      (requires a closing tag; checked before grep/edit/read).
+// rev: 2.19 — bare image path -> read tool call; tool calls after an early
+//      finish_reason=stop remove the stop and emit a tool_calls finish.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -279,6 +281,17 @@ function parseDsmlRead(text) {
   const limit = Number(param("limit"));
   if (Number.isFinite(limit)) args.limit = limit;
   return { name: "read", arguments: args };
+}
+
+// A bare image path at the end of a "let me look/check/upload..." message is
+// a malformed read. Convert it to a read-only tool call.
+function parseBareImageRead(text, prior) {
+  const t = String(text).trim();
+  const m = t.match(/([A-Za-z]:\\[^\n]*?\.(?:jpg|jpeg|png|gif|webp))\s*$/i);
+  if (!m) return null;
+  const before = `${String(prior || "")}\n${t.slice(0, m.index)}`.toLowerCase();
+  if (!/(look|view|read|check|see|inspect|upload|avatar|image)/.test(before)) return null;
+  return { name: "read", arguments: { filePath: m[1] } };
 }
 
 // Conservative DSML write parser: `content` + `path`. Requires a closing
@@ -1096,6 +1109,16 @@ async function startServer(upstreamBase, port, mode) {
             }
           }
         };
+        // A tool call can arrive after the upstream already sent
+        // finish_reason=stop (some routes split the final chunk). Remove the
+        // early stop from the buffer so the client executes the tool call.
+        const prepareToolCallAfterFinish = () => {
+          if (!BUFFER_UNTIL_COMPLETE || !sawFinish) return;
+          for (let i = buffered.length - 1; i >= 0; i--) {
+            if (String(buffered[i]).includes('"finish_reason":"stop"')) { buffered.splice(i, 1); break; }
+          }
+          sawFinish = false;
+        };
         const ev = makeEventizer();
         const decoder = new TextDecoder();
         const readUp = makeReader(up);
@@ -1249,6 +1272,7 @@ async function startServer(upstreamBase, port, mode) {
           // Convert a text DSML edit block into a real edit tool call.
           const dsmlEdit = parseDsmlEdit(contentDelta(data));
           if (dsmlEdit) {
+            prepareToolCallAfterFinish();
             commitData();
             const call = {
               choices: [{
@@ -1268,9 +1292,33 @@ async function startServer(upstreamBase, port, mode) {
             log(`converted DSML edit to tool_calls: ${dsmlEdit.arguments.filePath}`);
             return null;
           }
+          // Convert a bare image path into a real read tool call.
+          const bareImage = parseBareImageRead(contentDelta(data), sentContent);
+          if (bareImage) {
+            prepareToolCallAfterFinish();
+            commitData();
+            const call = {
+              choices: [{
+                delta: {
+                  tool_calls: [{
+                    index: 0,
+                    id: `call_dsml_${++dsmlCallSeq}`,
+                    type: "function",
+                    function: { name: bareImage.name, arguments: JSON.stringify(bareImage.arguments) },
+                  }],
+                },
+              }],
+            };
+            try { res.write(`data: ${JSON.stringify(call)}\n\n`); } catch {}
+            sawToolCalls = true;
+            syntheticToolCall = true;
+            log(`converted bare image path to read tool_calls: ${bareImage.arguments.filePath}`);
+            return null;
+          }
           // Convert a text DSML write block into a real write tool call.
           const dsmlWrite = parseDsmlWrite(contentDelta(data));
           if (dsmlWrite) {
+            prepareToolCallAfterFinish();
             commitData();
             const call = {
               choices: [{
@@ -1293,6 +1341,7 @@ async function startServer(upstreamBase, port, mode) {
           // Convert a text DSML grep block into a real grep tool call.
           const dsmlGrep = parseDsmlGrep(contentDelta(data));
           if (dsmlGrep) {
+            prepareToolCallAfterFinish();
             commitData();
             const call = {
               choices: [{
@@ -1315,6 +1364,7 @@ async function startServer(upstreamBase, port, mode) {
           // Convert a text DSML read block into a real read tool call.
           const dsmlRead = parseDsmlRead(contentDelta(data));
           if (dsmlRead) {
+            prepareToolCallAfterFinish();
             commitData();
             const call = {
               choices: [{
@@ -1406,9 +1456,10 @@ async function startServer(upstreamBase, port, mode) {
               }
             }
             if (!sawFinish) {
-              try { res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`); } catch {}
+              const fin = (sawToolCalls || syntheticToolCall) ? "tool_calls" : "stop";
+              try { res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: fin }] })}\n\n`); } catch {}
               sawFinish = true;
-              log(`synthesized finish_reason before [DONE]`);
+              log(`synthesized finish_reason (${fin}) before [DONE]`);
             }
             dbg(`fwd raw: [DONE]`);
             res.write(raw + "\n\n");
