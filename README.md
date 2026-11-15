@@ -166,7 +166,7 @@ Per-request overrides (stripped before forwarding): `x-lf-upstream`,
 bun test/run-tests.mjs
 ```
 
-Spins a mock upstream plus the proxy and asserts 34 scenarios: pre-commit
+Spins a mock upstream plus the proxy and asserts 36 scenarios: pre-commit
 retry, post-commit drop, in-band error retry, give-up after exactly 10 retries,
 null-field repair, mid-stream healing, non-stream passthrough, bulk-JSON
 conversion, stall retry, 200+8006 same-body retry, budget exhaustion surfacing
@@ -178,7 +178,8 @@ clean closes without `[DONE]`, post-commit continuation (retry + prefix-skip
 after a cut or transient error), abrupt-stop continuation
 (`finish_reason=stop` mid-sentence, including Unicode dashes and content in the
 finish chunk), empty-turn recovery (retry when a role-only chunk precedes a
-503), tool-call handoff during continuation, and large code-dump continuation.
+503), tool-call handoff during continuation, and large code-dump continuation
+(including after a prior tool call).
 
 ## Desktop working timer (optional)
 

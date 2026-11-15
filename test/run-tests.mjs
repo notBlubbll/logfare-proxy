@@ -350,6 +350,42 @@ const scenarios = {
       ]);
     }
   },
+  // Z6: DSML edit block streamed as text, finishing with tool_calls but no
+  // structured tool call -> treat as a code dump and continue.
+  "t-dsml-toolcall-continue": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify(CODE_PREFIX)}}}]}`,
+        '{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+        "[DONE]",
+      ]);
+    } else {
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify(CODE_FULL)}}}]}`,
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    }
+  },
+  // Z7: a prior tool call must not block a code-dump continuation.
+  "t-code-dump-after-toolcall": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      sse(res, [
+        '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"read","arguments":"{}"}}]}}]}',
+        `{"choices":[{"delta":{"content":${JSON.stringify(CODE_PREFIX)}}}]}`,
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    } else {
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify(CODE_FULL)}}}]}`,
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    }
+  },
   // Z: role-only chunk committed, then a 503 before any visible content ->
   // the proxy must retry instead of ending an empty turn.
   "t-empty-503-retry": (req, res) => {
@@ -563,6 +599,17 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     r = await readSSE("/v1/chat/completions", { model: "t-code-dump-continue", stream: true });
     const z5Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
     check("Z5: large code dump continued", textOf(r.text) === CODE_FULL && !z5Err && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-dsml-toolcall-continue", stream: true });
+    const z6Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    check("Z6: DSML text + tool_calls finish continued", textOf(r.text) === CODE_FULL && !z6Err && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-code-dump-after-toolcall", stream: true });
+    const z7Err = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    const z7Tool = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.choices?.[0]?.delta?.tool_calls; } catch { return false; } });
+    check("Z7: code dump continued after a tool call", textOf(r.text) === CODE_FULL && z7Tool && !z7Err && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     // N: text model + image -> vision model captions it, text model gets text only
     const imgBody = {

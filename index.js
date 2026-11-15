@@ -88,6 +88,8 @@
 //      continuation retry chooses a tool call, hand it to the client instead
 //      of ending partial; large file/code dumps ending at "}" are treated as
 //      cuts (one retry, no-progress guard stops repeats).
+// rev: 2.10 — code-dump continuation after tool calls: a prior Read/tool call
+//      no longer blocks the dump retry; finish diagnostics log toolCalls.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -1089,9 +1091,17 @@ async function startServer(upstreamBase, port, mode) {
             // regenerates it and the suffix starts with it (it was not sent).
             const finishContent = contentDelta(data);
             const combined = sentContent + finishContent;
-            const abrupt = (finishReason === "stop" || finishReason === "length")
-              && (looksIncomplete(combined) || looksLikePartialCode(combined));
-            if (abrupt && !sawToolCalls && sentContent.length > 0 && continuationAttempts < MAX_CONTINUATION
+            const codeDump = looksLikePartialCode(combined);
+            // A DSML edit block streamed as content can finish with
+            // tool_calls even though no structured tool call was sent. Treat
+            // it like a code dump: retry, then hand off any real tool call.
+            const abrupt = (finishReason === "stop" || finishReason === "length" || (finishReason === "tool_calls" && codeDump))
+              && (looksIncomplete(combined) || codeDump);
+            // A prior Read/tool call in the same turn must not block a code
+            // dump continuation; the retry may reproduce the text or hand off
+            // a new tool call.
+            const allowAfterToolCalls = codeDump && (finishReason === "stop" || finishReason === "length");
+            if (abrupt && (!sawToolCalls || allowAfterToolCalls) && sentContent.length > 0 && continuationAttempts < MAX_CONTINUATION
                 && (continuationPrefix === null || continuationEmitted > 0)) {
               continuationPrefix = sentContent;
               continuationAttempts++;
@@ -1099,7 +1109,7 @@ async function startServer(upstreamBase, port, mode) {
               return { bail: `post-commit continuation (${finishReason})`, rateLimited: false, neverForward: true, postCommit: true };
             }
             sawFinish = true;
-            log(`finish_reason=${finishReason} chars=${combined.length}`);
+            log(`finish_reason=${finishReason} chars=${combined.length} toolCalls=${sawToolCalls}`);
           }
           if (verdict.kind === "repair") {
             commitData();
