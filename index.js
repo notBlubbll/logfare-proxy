@@ -111,6 +111,9 @@
 //      (requires a closing tag; checked before grep/edit/read).
 // rev: 2.19 — bare image path -> read tool call; tool calls after an early
 //      finish_reason=stop remove the stop and emit a tool_calls finish.
+// rev: 2.20 — split DSML consolidation: the whole buffered response is
+//      joined, converted into one tool call, and DSML text dropped; bare
+//      reads omit offset/limit when absent.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -276,9 +279,11 @@ function parseDsmlRead(text) {
   }
   if (!filePath) return null;
   const args = { filePath };
-  const offset = Number(param("offset"));
+  const offsetStr = param("offset");
+  const offset = offsetStr === null ? NaN : Number(offsetStr);
   if (Number.isFinite(offset)) args.offset = offset;
-  const limit = Number(param("limit"));
+  const limitStr = param("limit");
+  const limit = limitStr === null ? NaN : Number(limitStr);
   if (Number.isFinite(limit)) args.limit = limit;
   return { name: "read", arguments: args };
 }
@@ -1089,7 +1094,9 @@ async function startServer(upstreamBase, port, mode) {
         let sawDone = false;
         let sawFinish = false;
         let sawToolCalls = false;
+        let structuredToolCalls = false;
         let syntheticToolCall = false;
+        let dsmlRaw = "";
         let dsmlCallSeq = 0;
         let forwardedChars = 0;
         let lastErr = null;
@@ -1272,6 +1279,7 @@ async function startServer(upstreamBase, port, mode) {
           // Convert a text DSML edit block into a real edit tool call.
           const dsmlEdit = parseDsmlEdit(contentDelta(data));
           if (dsmlEdit) {
+            dsmlRaw += contentDelta(data);
             prepareToolCallAfterFinish();
             commitData();
             const call = {
@@ -1295,6 +1303,7 @@ async function startServer(upstreamBase, port, mode) {
           // Convert a bare image path into a real read tool call.
           const bareImage = parseBareImageRead(contentDelta(data), sentContent);
           if (bareImage) {
+            dsmlRaw += contentDelta(data);
             prepareToolCallAfterFinish();
             commitData();
             const call = {
@@ -1318,6 +1327,7 @@ async function startServer(upstreamBase, port, mode) {
           // Convert a text DSML write block into a real write tool call.
           const dsmlWrite = parseDsmlWrite(contentDelta(data));
           if (dsmlWrite) {
+            dsmlRaw += contentDelta(data);
             prepareToolCallAfterFinish();
             commitData();
             const call = {
@@ -1341,6 +1351,7 @@ async function startServer(upstreamBase, port, mode) {
           // Convert a text DSML grep block into a real grep tool call.
           const dsmlGrep = parseDsmlGrep(contentDelta(data));
           if (dsmlGrep) {
+            dsmlRaw += contentDelta(data);
             prepareToolCallAfterFinish();
             commitData();
             const call = {
@@ -1364,6 +1375,7 @@ async function startServer(upstreamBase, port, mode) {
           // Convert a text DSML read block into a real read tool call.
           const dsmlRead = parseDsmlRead(contentDelta(data));
           if (dsmlRead) {
+            dsmlRaw += contentDelta(data);
             prepareToolCallAfterFinish();
             commitData();
             const call = {
@@ -1436,7 +1448,7 @@ async function startServer(upstreamBase, port, mode) {
             res.write(`data: ${verdict.text}\n\n`);
             forwardedChars += contentDelta(verdict.text).length;
             sentContent += contentDelta(verdict.text);
-            if (verdict.text.includes('"tool_calls"')) sawToolCalls = true;
+            if (verdict.text.includes('"tool_calls"')) { sawToolCalls = true; structuredToolCalls = true; }
             return null;
           }
           // logfare sometimes ends with [DONE] but never sends a chunk with a
@@ -1471,7 +1483,7 @@ async function startServer(upstreamBase, port, mode) {
           res.write(raw + "\n\n");
           forwardedChars += contentDelta(data).length;
           sentContent += contentDelta(data);
-          if (data.includes('"tool_calls"')) sawToolCalls = true;
+          if (data.includes('"tool_calls"')) { sawToolCalls = true; structuredToolCalls = true; }
           return null;
         };
 
@@ -1542,8 +1554,43 @@ async function startServer(upstreamBase, port, mode) {
             ensureStreamHeaders({}, retryCount);
             stopEarlyHeaderTimer();
             stopKeepalive();
-            if (!sawDone) buffered.push("data: [DONE]\n\n");
-            for (const chunk of buffered) { try { rawWrite(chunk); } catch {} }
+            // Consolidate split DSML blocks: the path may be in one content
+            // event and oldString/newString in later ones.
+            let out = buffered;
+            if (!structuredToolCalls) {
+              let text = dsmlRaw;
+              for (const chunk of buffered) {
+                const m = String(chunk).match(/^data: (.*)\n\n$/s);
+                if (!m) continue;
+                try {
+                  const j = JSON.parse(m[1]);
+                  const c = j?.choices?.[0]?.delta?.content;
+                  if (typeof c === "string") text += c;
+                } catch {}
+              }
+              if (text) {
+                const call = parseDsmlWrite(text) || parseDsmlGrep(text) || parseDsmlEdit(text) || parseDsmlRead(text) || parseBareImageRead(text, "");
+                if (call) {
+                  const p = call.arguments.filePath || call.arguments.path || "";
+                  const tagA = text.indexOf("< | DSML |");
+                  const tagB = text.indexOf("</ | DSML |");
+                  const firstTag = Math.min(tagA < 0 ? Infinity : tagA, tagB < 0 ? Infinity : tagB);
+                  const pathIdx = p ? text.indexOf(p) : -1;
+                  let idx = Math.min(firstTag, pathIdx < 0 ? Infinity : pathIdx);
+                  if (!Number.isFinite(idx)) idx = text.length;
+                  const narration = text.slice(0, idx).trimEnd();
+                  const rebuilt = [];
+                  if (narration) rebuilt.push(`data: ${JSON.stringify({ choices: [{ delta: { content: narration } }] })}\n\n`);
+                  rebuilt.push(`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: `call_dsml_${++dsmlCallSeq}`, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } }] } }] })}\n\n`);
+                  rebuilt.push(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`);
+                  rebuilt.push("data: [DONE]\n\n");
+                  out = rebuilt;
+                  log(`post-processed buffered DSML into ${call.name} tool_calls`);
+                }
+              }
+            }
+            if (out === buffered && !sawDone) buffered.push("data: [DONE]\n\n");
+            for (const chunk of out) { try { rawWrite(chunk); } catch {} }
             endStream();
             try { up.destroy(); } catch {}
             log(`req ${pathAndQuery}: stream done (buffered) retries=${retryCount} chars=${sentContent.length} sawDone=${sawDone} sawFinish=${sawFinish} in ${Date.now() - started}ms`);

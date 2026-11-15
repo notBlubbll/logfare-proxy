@@ -535,6 +535,16 @@ const scenarios = {
       "[DONE]",
     ]);
   },
+  // Z20: DSML block split across content events (path first, oldString later)
+  // -> buffer post-process consolidates into one read tool call.
+  "t-split-dsml-read": (req, res) => {
+    sse(res, [
+      '{"choices":[{"delta":{"content":"C:\\\\Users\\\\User\\\\Desktop\\\\EXPERIMENTS\\\\DISCORD\\\\CHATBOT\\\\src\\\\modules\\\\status-card\\\\index.ts</ | DSML | parameter >"}}]}',
+      '{"choices":[{"delta":{"content":" < | DSML | parameter name=\\"oldString\\" string=\\"true\\">const A = 1;"}}]}',
+      '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+      "[DONE]",
+    ]);
+  },
   // Z: role-only chunk committed, then a 503 before any visible content ->
   // the proxy must retry instead of ending an empty turn.
   "t-empty-503-retry": (req, res) => {
@@ -922,6 +932,12 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     const bufImageAfter = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; return tc?.function?.name === "read" && String(tc.function.arguments).includes("warden.jpg"); } catch { return false; } });
     const bufImageAfterFin = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
     check("BUF: tool call after finish gets tool_calls finish", bufImageAfter && bufImageAfterFin && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-split-dsml-read", stream: true }, BUFFER_PORT);
+    const bufSplit = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; return tc?.function?.name === "read" && String(tc.function.arguments).includes("status-card"); } catch { return false; } });
+    const bufSplitFin = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
+    check("BUF: split DSML consolidated into one read", bufSplit && bufSplitFin && !textOf(r.text).includes("oldString") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     bufferProxy.kill();
   } catch (e) {
