@@ -16,6 +16,10 @@ const RUNTIME = process.execPath; // bun or node, whichever runs this file
 let hits = []; // { model, n }
 let hitCount = 0;
 
+const ABRUPT_PREFIX = "Let me keep it simple and honest: the locale file blurbs are authored from the actual persona prompts, which I just";
+const ABRUPT_FULL = ABRUPT_PREFIX + " realized should live in the persona's own data and completed cleanly.";
+const COMPLETE_TEXT = "This answer is already complete and ends with a period, so it must not be continued by the proxy.";
+
 function sse(res, events, opts = {}) {
   res.writeHead(200, { "content-type": "text/event-stream", ...opts.headers });
   let i = 0;
@@ -244,6 +248,32 @@ const scenarios = {
       ]);
     }
   },
+  // X: the model sends finish_reason=stop but the text ends mid-sentence ->
+  // treat it as a cut and continue after the sent prefix.
+  "t-abrupt-stop-continue": (req, res) => {
+    const n = hitCount;
+    if (n === 1) {
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify(ABRUPT_PREFIX)}}}]}`,
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    } else {
+      sse(res, [
+        `{"choices":[{"delta":{"content":${JSON.stringify(ABRUPT_FULL)}}}]}`,
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ]);
+    }
+  },
+  // Y: a complete stop (terminal punctuation) must not trigger continuation.
+  "t-abrupt-stop-complete": (req, res) => {
+    sse(res, [
+      `{"choices":[{"delta":{"content":${JSON.stringify(COMPLETE_TEXT)}}}]}`,
+      '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+      "[DONE]",
+    ]);
+  },
 };
 
 const mock = createServer((req, res) => {
@@ -401,6 +431,17 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     r = await readSSE("/v1/chat/completions", { model: "t-truncate-continue", stream: true });
     const wErr = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
     check("W: truncated stream continued after sent prefix", textOf(r.text) === "Part one two!" && !wErr && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-abrupt-stop-continue", stream: true });
+    const xErr = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    check("X: abrupt stop mid-answer continued", textOf(r.text) === ABRUPT_FULL && !xErr && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    const hitsBeforeY = hits.length;
+    r = await readSSE("/v1/chat/completions", { model: "t-abrupt-stop-complete", stream: true });
+    const yErr = dataLines(r.text).some((d) => { try { return !!JSON.parse(d)?.error; } catch { return false; } });
+    check("Y: complete stop not continued", textOf(r.text) === COMPLETE_TEXT && hits.length - hitsBeforeY === 1 && !yErr, `hits=${hits.length - hitsBeforeY} text=${JSON.stringify(r.text)}`);
 
     // N: text model + image -> vision model captions it, text model gets text only
     const imgBody = {

@@ -73,6 +73,10 @@
 //      proxy retries the SAME request and skips the prefix already sent,
 //      streaming only the new suffix. If the retry diverges, it closes the
 //      partial answer cleanly instead of showing an error/retry loop.
+// rev: 2.5 — abrupt-stop continuation: models sometimes send
+//      finish_reason=stop mid-sentence. If the streamed text looks incomplete
+//      (prose ending in a word/comma/colon, or an unclosed code fence), the
+//      proxy treats it as a cut and uses the same prefix-skip continuation.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -151,6 +155,19 @@ const ATTEMPT_TIMEOUT_MS = 1800000; // per attempt, mirrors provider timeout
 const KEEPALIVE_MS = 15000; // SSE comment keepalive while headers sent but no data committed
 const EARLY_HEADER_MS = 20000; // send SSE headers+keepalives if no data committed within this window (prevents client header timeout)
 const LOG_MAX_BYTES = 2 * 1024 * 1024;
+
+// A "stop" that ends mid-sentence is treated as a cut, not a completed turn.
+// Conservative: only prose-like endings (letters/digits/comma/semicolon/colon/
+// hyphen/backtick), and only after enough text to avoid retrying short answers.
+function looksIncomplete(text) {
+  const t = String(text).trimEnd();
+  if (t.length < 80) return false;
+  if (((t.match(/```/g) || []).length % 2) === 1) return true; // unclosed code fence
+  const last = t[t.length - 1];
+  if (/[.!?…"'”’)\]}»]/.test(last)) return false;
+  if (last === ":") return true;
+  return /[A-Za-z0-9,;:_`-]/.test(last);
+}
 
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
 const LOG_FILE = path.join(PLUGIN_DIR, ".logfare-proxy.log");
@@ -1019,6 +1036,14 @@ async function startServer(upstreamBase, port, mode) {
           }
           const finishReason = finishReasonOf(data);
           if (finishReason !== null) {
+            const abrupt = (finishReason === "stop" || finishReason === "length") && looksIncomplete(sentContent);
+            if (abrupt && !sawToolCalls && sentContent.length > 0 && continuationAttempts < MAX_CONTINUATION
+                && (continuationPrefix === null || continuationEmitted > 0)) {
+              continuationPrefix = sentContent;
+              continuationAttempts++;
+              log(`abrupt ${finishReason} mid-answer; continuation ${continuationAttempts}/${MAX_CONTINUATION} after ${sentContent.length} chars`);
+              return { bail: `post-commit continuation (${finishReason})`, rateLimited: false, neverForward: true, postCommit: true };
+            }
             sawFinish = true;
             log(`finish_reason=${finishReason} chars=${sentContent.length}`);
           }
