@@ -563,6 +563,15 @@ const scenarios = {
       ]);
     }
   },
+  // Z22: DSML shell (command + timeout) -> real shell tool call.
+  "t-dsml-shell-toolcall": (req, res) => {
+    const dsml = '< | DSML | parameter name="command" string="true">cd C:\\Users\\User\\Desktop\\EXPERIMENTS\\DISCORD\\CHATBOT; bun tsc --noEmit *> .tmp\\s1.log; echo EXIT:$LASTEXITCODE; Get-Content .tmp\\s1.log -Tail 10 < | DSML | parameter name="timeout" string="false">900000';
+    sse(res, [
+      `{"choices":[{"delta":{"content":${JSON.stringify(dsml)}}}]}`,
+      '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+      "[DONE]",
+    ]);
+  },
   // Z: role-only chunk committed, then a 503 before any visible content ->
   // the proxy must retry instead of ending an empty turn.
   "t-empty-503-retry": (req, res) => {
@@ -636,6 +645,9 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
   }
 
   try {
+    const st = await fetch(`http://127.0.0.1:${PROXY_PORT}/status`).then((x) => x.json()).catch(() => null);
+    check("STATUS: endpoint", st && typeof st.active === "number" && typeof st.retries === "number", JSON.stringify(st));
+
     hitCount = 0;
     let r = await readSSE("/v1/chat/completions", { model: "t-precommit-retry", stream: true });
     check("A: retried once", r.retries === "1", `retries=${r.retries}`);
@@ -961,7 +973,13 @@ mock.listen(MOCK_PORT, "127.0.0.1", async () => {
     r = await readSSE("/v1/chat/completions", { model: "t-incomplete-edit-retry", stream: true }, BUFFER_PORT);
     const bufEditRetry = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; const a = JSON.parse(tc?.function?.arguments || "{}"); return tc?.function?.name === "edit" && a.oldString === "const A = 1;" && a.newString === "const A = 2;"; } catch { return false; } });
     const bufEditRetryFin = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
-    check("BUF: incomplete edit retried into a complete edit", bufEditRetry && bufEditRetryFin && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+    check("Z21: incomplete edit retried into a complete edit", bufEditRetry && bufEditRetryFin && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
+
+    hitCount = 0;
+    r = await readSSE("/v1/chat/completions", { model: "t-dsml-shell-toolcall", stream: true }, BUFFER_PORT);
+    const bufShell = dataLines(r.text).some((d) => { try { const tc = JSON.parse(d)?.choices?.[0]?.delta?.tool_calls?.[0]; const a = JSON.parse(tc?.function?.arguments || "{}"); return tc?.function?.name === "shell" && String(a.command).includes("bun tsc") && a.timeout === 900000; } catch { return false; } });
+    const bufShellFin = dataLines(r.text).some((d) => { try { return JSON.parse(d)?.choices?.[0]?.finish_reason === "tool_calls"; } catch { return false; } });
+    check("BUF: DSML shell converted to tool call", bufShell && bufShellFin && !r.text.includes("< | DSML |") && r.text.includes("[DONE]"), `text=${JSON.stringify(r.text)}`);
 
     bufferProxy.kill();
   } catch (e) {

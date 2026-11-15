@@ -116,6 +116,7 @@
 //      reads omit offset/limit when absent.
 // rev: 2.21 — incomplete edit (oldString XOR newString) is a broken tool call:
 //      buffer mode retries the whole request instead of converting to read/write.
+// rev: 2.22 — DSML shell conversion: command + timeout -> real shell tool call.
 // Standalone: `bun index.js` runs the same server outside opencode with env
 // overrides LOGFARE_PROXY_PORT / LOGFARE_PROXY_UPSTREAM / LOGFARE_PROXY_KEY /
 // LOGFARE_PROXY_DEBUG=1 (verbose event tracing).
@@ -128,6 +129,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const TAG = "[logfare-proxy]";
+const proxyState = { active: 0, retries: 0, attempts: 0, model: null, updated: 0 };
 const UPSTREAM_DEFAULT = "https://logfare.ai/v1";
 const LISTEN_HOST = "127.0.0.1";
 const PORT_DEFAULT = 17330;
@@ -309,6 +311,24 @@ function isIncompleteDsmlEdit(text) {
   const hasOld = /parameter\s+name="oldString"/.test(t);
   const hasNew = /parameter\s+name="newString"/.test(t);
   return (hasOld && !hasNew) || (!hasOld && hasNew);
+}
+
+// Conservative DSML shell parser: `command` + optional `timeout`.
+function parseDsmlShell(text) {
+  const t = String(text);
+  if (!t.includes("< | DSML |") && !t.includes("</ | DSML |")) return null;
+  const param = (name) => {
+    const re = new RegExp(`<\\s*\\|\\s*DSML\\s*\\|\\s*parameter\\s+name="${name}"\\s+string="(?:true|false)">([\\s\\S]*?)(?=<\\s*\\/?\\s*\\|\\s*DSML\\s*\\||$)`);
+    const m = t.match(re);
+    return m ? m[1].trim() : null;
+  };
+  const command = param("command");
+  if (!command) return null;
+  const args = { command };
+  const timeoutStr = param("timeout");
+  const timeout = timeoutStr === null ? NaN : Number(timeoutStr);
+  if (Number.isFinite(timeout)) args.timeout = timeout;
+  return { name: "shell", arguments: args };
 }
 
 // Conservative DSML write parser: `content` + `path`. Requires a closing
@@ -803,6 +823,30 @@ async function startServer(upstreamBase, port, mode) {
       res.end("logfare-proxy OK");
       return;
     }
+    if (pathAndQuery === "/status" || pathAndQuery === "/status/") {
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "access-control-allow-origin": "*",
+        "cache-control": "no-store",
+      });
+      res.end(JSON.stringify({
+        active: proxyState.active,
+        retries: proxyState.retries,
+        attempts: proxyState.attempts,
+        model: proxyState.model,
+        updated: proxyState.updated,
+      }));
+      return;
+    }
+    proxyState.active++;
+    proxyState.updated = Date.now();
+    res.on("close", () => {
+      proxyState.active = Math.max(0, proxyState.active - 1);
+      if (proxyState.active === 0) {
+        proxyState.retries = 0;
+        proxyState.attempts = 0;
+      }
+    });
 
     // buffer the request body (retries need a replayable body)
     const chunks = [];
@@ -989,6 +1033,10 @@ async function startServer(upstreamBase, port, mode) {
     const MAX_CONTINUATION = 3;
     for (let attempt = 1; ; attempt++) {
       attemptsUsed = attempt;
+      proxyState.attempts = attempt;
+      proxyState.retries = attempt - 1;
+      proxyState.model = model;
+      proxyState.updated = Date.now();
       if (clientGone) { stopKeepalive(); log(`req ${pathAndQuery}: client gone, stop`); return; }
       const retryCount = attempt - 1;
       let up = null;
@@ -1341,6 +1389,30 @@ async function startServer(upstreamBase, port, mode) {
             log(`converted bare image path to read tool_calls: ${bareImage.arguments.filePath}`);
             return null;
           }
+          // Convert a text DSML shell block into a real shell tool call.
+          const dsmlShell = parseDsmlShell(contentDelta(data));
+          if (dsmlShell) {
+            dsmlRaw += contentDelta(data);
+            prepareToolCallAfterFinish();
+            commitData();
+            const call = {
+              choices: [{
+                delta: {
+                  tool_calls: [{
+                    index: 0,
+                    id: `call_dsml_${++dsmlCallSeq}`,
+                    type: "function",
+                    function: { name: dsmlShell.name, arguments: JSON.stringify(dsmlShell.arguments) },
+                  }],
+                },
+              }],
+            };
+            try { res.write(`data: ${JSON.stringify(call)}\n\n`); } catch {}
+            sawToolCalls = true;
+            syntheticToolCall = true;
+            log(`converted DSML shell to tool_calls: ${dsmlShell.arguments.command.slice(0, 60)}`);
+            return null;
+          }
           // Convert a text DSML write block into a real write tool call.
           const dsmlWrite = parseDsmlWrite(contentDelta(data));
           if (dsmlWrite) {
@@ -1597,7 +1669,7 @@ async function startServer(upstreamBase, port, mode) {
                 } catch {}
               }
               if (text) {
-                const call = parseDsmlWrite(text) || parseDsmlGrep(text) || parseDsmlEdit(text) || parseDsmlRead(text) || parseBareImageRead(text, "");
+                const call = parseDsmlShell(text) || parseDsmlWrite(text) || parseDsmlGrep(text) || parseDsmlEdit(text) || parseDsmlRead(text) || parseBareImageRead(text, "");
                 if (call) {
                   const p = call.arguments.filePath || call.arguments.path || "";
                   const tagA = text.indexOf("< | DSML |");
